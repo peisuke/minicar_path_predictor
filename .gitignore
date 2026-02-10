@@ -1,0 +1,24 @@
+# Build directories
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Data (large files)
+data/training/
+data/models/
+data/visualizations/
+
+# Keep data structure
+!data/images/
+
+# Weights
+weights/
+
+# IDE
+.vscode/
+.idea/

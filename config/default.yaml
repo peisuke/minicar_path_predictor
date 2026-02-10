@@ -1,0 +1,56 @@
+# Minicar Path Predictor Configuration
+
+# Directory structure
+paths:
+  images_dir: "data/images"        # Course images
+  sim_data_dir: "data/sim_robot"   # Simulation measurement data
+  weights_dir: "weights"           # Model weights
+
+# Course image settings
+course:
+  resolution: 0.02  # meters per pixel
+  wall_threshold: 50  # grayscale threshold for black walls
+  path_threshold_low: 100  # HSV threshold for red path detection
+  path_threshold_high: 255
+
+# LiDAR simulation settings (matching minicar_simulation)
+lidar:
+  num_rays: 360  # number of rays
+  angle_min: 0.0  # radians
+  angle_max: 6.283185307  # 2*pi radians
+  range_min: 0.15  # meters
+  range_max: 12.0  # meters (12m range)
+  noise_std: 0.005  # Gaussian noise standard deviation
+  # Blind spot (rear masking) - angles in degrees
+  blind_spot_start: 115.0
+  blind_spot_end: 246.0
+
+# Training data generation
+data_generation:
+  grid_spacing: 0.05  # meters between sample points
+  num_orientations: 36  # number of orientations per point (every 10 degrees)
+  lookahead_distance: 0.3  # meters for target pose calculation
+  path_points: 5  # number of waypoints to output
+
+# Model settings
+model:
+  input_dim: 360  # LiDAR rays (after masking, inf values become max_range)
+  hidden_dims: [256, 128, 64]
+  output_dim: 10  # 5 waypoints * 2 (x, y)
+  dropout: 0.1
+
+# Training settings
+training:
+  batch_size: 64
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  early_stopping_patience: 10
+
+# Inference settings
+inference:
+  model_path: "weights/best_model.pth"
+  device: "cuda"  # or "cpu"

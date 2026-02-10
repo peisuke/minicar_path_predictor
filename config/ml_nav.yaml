@@ -1,0 +1,24 @@
+# ML Navigation Node Configuration
+# Compatible with minicar_navigation parameters
+
+ml_nav_node:
+  ros__parameters:
+    # Model settings
+    model_path: "/home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor.pt"
+
+    # Control parameters (matching minicar_navigation defaults)
+    lookahead_distance: 0.5    # Look-ahead distance [m]
+    target_velocity: 0.3       # Target linear velocity [m/s]
+    max_angular_velocity: 1.0  # Maximum angular velocity [rad/s]
+
+    # PD control parameters
+    kp_angular: 2.0            # Angular velocity proportional gain
+    kd_angular: 0.5            # Angular velocity derivative gain
+
+    # Control loop rate
+    control_rate: 10.0         # Hz
+
+    # Emergency stop parameters
+    emergency_stop_dist: 0.20      # Stop if obstacle within 20cm
+    emergency_stop_cone_deg: 45.0  # Check front ±45° cone
+    emergency_stop_ratio: 0.3      # Stop if 30% of cone is below threshold
