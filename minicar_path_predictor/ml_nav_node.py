@@ -93,8 +93,10 @@ class AngleClassifierCNN(nn.Module):
         return x
 
 
-def class_to_angle(class_idx, num_classes=9, angle_range=math.pi):
+def class_to_angle(class_idx, num_classes=9, angle_range=math.pi, bin_centers=None):
     """Convert class index back to angle (radians)."""
+    if bin_centers is not None:
+        return bin_centers[class_idx]
     class_width = angle_range / num_classes
     angle = -angle_range/2 + (class_idx + 0.5) * class_width
     return angle
@@ -238,6 +240,10 @@ class MLNavNode(Node):
         self.prev_angle_error = 0.0
         self.prev_time = None
 
+        # EMA smoothing state
+        self.smoothed_angle = 0.0
+        self.ema_alpha = 0.4  # Configurable: 0=fully smooth, 1=no smoothing
+
         # LiDAR data
         self.latest_lidar_data = None
         self.received_scan = False
@@ -262,6 +268,7 @@ class MLNavNode(Node):
         self.get_logger().info(f"  Velocity: target={self.target_velocity}, min={self.min_velocity}")
         self.get_logger().info(f"  PD control: kp={self.kp_angular}, kd={self.kd_angular}, k_curv={self.k_curvature}")
         self.get_logger().info(f"  Max angular vel: {self.max_angular_velocity} rad/s")
+        self.get_logger().info(f"  EMA alpha: {self.ema_alpha}, Softmax weighted avg: enabled")
 
     def _get_parameters_as_dict(self, prefix: str) -> dict:
         """指定されたプレフィックスのパラメータを辞書として取得"""
@@ -275,8 +282,9 @@ class MLNavNode(Node):
         return param_dict
 
     def _load_control_params(self):
-        """Load control parameters from hierarchical structure (common.* and controllers.pd.*)."""
+        """Load control parameters from hierarchical structure (common.*, prediction.*, controllers.pd.*)."""
         common_params = self._get_parameters_as_dict('common')
+        prediction_params = self._get_parameters_as_dict('prediction')
         pd_params = self._get_parameters_as_dict('controllers.pd')
 
         # Common parameters
@@ -284,6 +292,9 @@ class MLNavNode(Node):
         self.target_velocity = common_params.get('target_velocity', 0.3)
         self.max_angular_velocity = common_params.get('max_angular_velocity', 1.0)
         self.goal_tolerance = common_params.get('goal_tolerance', 0.1)
+
+        # Prediction smoothing
+        self.ema_alpha = prediction_params.get('ema_alpha', 0.4)
 
         # PD controller parameters
         self.kp_angular = pd_params.get('kp_angular', 2.0)
@@ -294,7 +305,8 @@ class MLNavNode(Node):
     def _on_parameters_updated(self, params: list) -> SetParametersResult:
         """パラメータ更新を検知して制御パラメータを再読み込み"""
         relevant = any(
-            p.name.startswith("common.") or p.name.startswith("controllers.")
+            p.name.startswith("common.") or p.name.startswith("prediction.")
+            or p.name.startswith("controllers.")
             for p in params
         )
 
@@ -398,6 +410,10 @@ class MLNavNode(Node):
             self.is_multitask = checkpoint.get('is_multitask', 'multitask' in self.model_type)
             self.is_bev = checkpoint.get('is_bev', 'bev' in self.model_type)
 
+            # Non-uniform bin centers (None if uniform bins)
+            bin_centers_list = checkpoint.get('bin_centers', None)
+            self.bin_centers = bin_centers_list if bin_centers_list is None else list(bin_centers_list)
+
             # BEV parameters (check both old and new keys for compatibility)
             self.bev_image_size = checkpoint.get('bev_image_size', checkpoint.get('image_size', 64))
             self.bev_view_range = checkpoint.get('bev_view_range', checkpoint.get('view_range', 3.0))
@@ -424,9 +440,10 @@ class MLNavNode(Node):
             model = model.to(self.device)
             model.eval()
             self.max_range = checkpoint.get('max_range', 12.0)
+            bins_info = "nonuniform" if self.bin_centers else "uniform"
             self.get_logger().info(
                 f"Model loaded: arch={self.model_arch}, classes={self.num_classes}, "
-                f"multitask={self.is_multitask}, bev={self.is_bev}"
+                f"multitask={self.is_multitask}, bev={self.is_bev}, bins={bins_info}"
             )
             return model
         except Exception as e:
@@ -470,12 +487,18 @@ class MLNavNode(Node):
             return
 
         try:
-            # Predict target angle and path validity
-            target_angle, has_path = self._predict_angle(lidar_data["ranges"])
+            # Predict target angle, path validity, and confidence
+            raw_angle, has_path, confidence = self._predict_angle(lidar_data["ranges"])
+
+            # EMA smoothing for temporal consistency
+            self.smoothed_angle = (self.ema_alpha * raw_angle
+                                   + (1 - self.ema_alpha) * self.smoothed_angle)
+            target_angle = self.smoothed_angle
 
             # Compute control using PD control (lock for thread safety)
             with self._ctrl_lock:
-                linear_vel, angular_vel = self._compute_pd_control(target_angle)
+                linear_vel, angular_vel = self._compute_pd_control(
+                    target_angle, confidence)
 
             # Publish command
             cmd = Twist()
@@ -484,7 +507,9 @@ class MLNavNode(Node):
             self._publish_cmd_vel(cmd)
 
             self.get_logger().info(
-                f"Control: angle={math.degrees(target_angle):.1f}°, "
+                f"Control: raw={math.degrees(raw_angle):.1f}°, "
+                f"smoothed={math.degrees(target_angle):.1f}°, "
+                f"conf={confidence:.2f}, "
                 f"linear={linear_vel:.3f}, angular={angular_vel:.3f}"
             )
 
@@ -495,8 +520,11 @@ class MLNavNode(Node):
     def _predict_angle(self, ranges: np.ndarray) -> tuple:
         """Predict target angle from LiDAR ranges.
 
+        Uses softmax-weighted average of bin centers for continuous angle output
+        instead of discrete argmax.
+
         Returns:
-            (angle, has_path): angle in radians, has_path boolean
+            (angle, has_path, confidence): angle in radians, has_path boolean, confidence [0,1]
         """
         # Normalize
         normalized = np.clip(ranges, 0, self.max_range) / self.max_range
@@ -517,24 +545,38 @@ class MLNavNode(Node):
             if self.is_multitask:
                 path_logit, angle_logits = self.model(x)
                 has_path = torch.sigmoid(path_logit).item() > 0.5
-                pred_class = torch.argmax(angle_logits, dim=1).item()
             else:
-                logits = self.model(x)
-                pred_class = torch.argmax(logits, dim=1).item()
+                angle_logits = self.model(x)
                 has_path = True  # Single-task models always assume path exists
 
-        # Convert class to angle
-        angle = class_to_angle(pred_class, self.num_classes, self.angle_range)
+            # Softmax-weighted average for continuous angle output
+            probs = torch.softmax(angle_logits, dim=1).squeeze(0)  # (num_classes,)
+            confidence = probs.max().item()
 
-        return angle, has_path
+            if self.bin_centers is not None:
+                centers = torch.tensor(self.bin_centers, dtype=torch.float32, device=self.device)
+            else:
+                # Uniform bins
+                centers = torch.tensor(
+                    [class_to_angle(i, self.num_classes, self.angle_range)
+                     for i in range(self.num_classes)],
+                    dtype=torch.float32, device=self.device
+                )
+            angle = (probs * centers).sum().item()
 
-    def _compute_pd_control(self, target_angle: float) -> tuple:
+        return angle, has_path, confidence
+
+    def _compute_pd_control(self, target_angle: float,
+                            confidence: float = 1.0) -> tuple:
         """Compute PD control for velocity commands.
 
-        Same formula as minicar_navigation's pd_pursuit_controller.
+        Based on minicar_navigation's pd_pursuit_controller with enhancements:
+        - Angle change rate as pseudo-curvature for curve deceleration
+        - Confidence-based speed modulation
 
         Args:
             target_angle: Target angle in radians (robot frame)
+            confidence: Model prediction confidence [0, 1]
 
         Returns:
             (linear_velocity, angular_velocity)
@@ -552,6 +594,7 @@ class MLNavNode(Node):
             else:
                 angle_error_dot = 0.0
         else:
+            dt = 0.0
             angle_error_dot = 0.0
 
         angular_vel = self.kp_angular * angle_error + self.kd_angular * angle_error_dot
@@ -561,11 +604,20 @@ class MLNavNode(Node):
                           min(self.max_angular_velocity, angular_vel))
 
         # Linear velocity (reduce when turning)
-        # Same formula as minicar_navigation's pd_pursuit_controller
-        curvature = 0.0  # MLモデルでは曲率計算なし
-        curvature_factor = 1.0 / (1.0 + self.k_curvature * abs(curvature))
+        # Pseudo-curvature from angle change rate
+        if dt > 0:
+            angle_rate = abs(angle_error - self.prev_angle_error) / dt
+        else:
+            angle_rate = 0.0
+        curvature_factor = 1.0 / (1.0 + self.k_curvature * angle_rate)
+
         heading_factor = max(0.5, 1.0 - abs(angle_error) / math.pi)
-        linear_vel = self.target_velocity * curvature_factor * heading_factor
+
+        # Confidence-based modulation: low confidence -> slow down
+        confidence_factor = 0.5 + 0.5 * confidence  # [0.5, 1.0]
+
+        linear_vel = (self.target_velocity * curvature_factor
+                      * heading_factor * confidence_factor)
         linear_vel = max(self.min_velocity, linear_vel)
 
         # Update state

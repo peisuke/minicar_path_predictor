@@ -29,25 +29,33 @@ def get_run_name_with_timestamp(base_name: str) -> str:
     return f"run_{timestamp}"
 
 
-def get_nonuniform_bins(angle_range_deg=90):
+def get_nonuniform_bins(angle_range_deg=90, num_classes=13):
     """Get non-uniform bin boundaries with finer resolution near center.
 
-    Boundaries: ±2.5°, ±7.5°, ±17.5°, ±32.5°, ±(angle_range/2)
-    Center class [-2.5°, +2.5°) has highest resolution (5°).
-    Resolution decreases toward edges: 5° -> 10° -> 15° -> edge
+    13-class (default): Center-concentrated with 2° resolution within ±5°.
+        Boundaries: [-45, -30, -20, -10, -5, -3, -1, +1, +3, +5, +10, +20, +30, +45]
+        Resolution: 2° (center) -> 5° -> 10° -> 15° (edge)
+
+    9-class (legacy): Finer resolution near center with 5° minimum.
+        Boundaries: [-45, -32.5, -17.5, -7.5, -2.5, +2.5, +7.5, +17.5, +32.5, +45]
+        Resolution: 5° (center) -> 10° -> 15° -> edge
 
     Returns boundaries and centers in radians.
     """
     half = angle_range_deg / 2  # e.g., 45° for ±45° range
-    # Boundaries in degrees: [-45, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, 45]
-    boundaries_deg = np.array([-half, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, half])
-    # Clip to actual range
+
+    if num_classes == 13:
+        # 13-class: center-concentrated
+        # Resolution from center: 2° -> 2° -> 2° -> 5° -> 10° -> 10° -> 15°
+        boundaries_deg = np.array([-half, -30, -20, -10, -5, -3, -1, 1, 3, 5, 10, 20, 30, half])
+    else:
+        # 9-class: legacy
+        boundaries_deg = np.array([-half, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, half])
+
     boundaries_deg = np.clip(boundaries_deg, -half, half)
-    # Remove duplicates and sort
     boundaries_deg = np.unique(boundaries_deg)
 
     boundaries_rad = np.radians(boundaries_deg)
-    # Centers are midpoints between boundaries
     centers_rad = (boundaries_rad[:-1] + boundaries_rad[1:]) / 2
     return boundaries_rad, centers_rad
 
@@ -392,7 +400,7 @@ def main():
     bin_boundaries = None
     bin_centers = None
     if args.nonuniform_bins:
-        bin_boundaries, bin_centers = get_nonuniform_bins(args.angle_range)
+        bin_boundaries, bin_centers = get_nonuniform_bins(args.angle_range, args.num_classes)
         num_classes = len(bin_centers)  # Override num_classes based on boundaries
         print(f"  Using non-uniform bins: {len(bin_centers)} classes")
         print(f"  Boundaries (deg): {np.degrees(bin_boundaries).astype(int)}")
