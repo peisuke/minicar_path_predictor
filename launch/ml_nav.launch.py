@@ -25,13 +25,6 @@ def generate_launch_description():
         description='Path to params YAML for ml_nav_node'
     )
 
-    # Model path
-    model_path_arg = DeclareLaunchArgument(
-        'model_path',
-        default_value='/home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor_multi_dist.pt',
-        description='Path to trained model'
-    )
-
     # Namespace configuration (matching minicar_navigation)
     sim_ns = DeclareLaunchArgument('sim_ns', default_value='sim_robot')
     real_ns = DeclareLaunchArgument('real_ns', default_value='real_robot')
@@ -55,8 +48,7 @@ def generate_launch_description():
         parameters=[
             LaunchConfiguration('params_file'),
             {
-                # Override with launch arguments
-                'model_path': LaunchConfiguration('model_path'),
+                # Override with launch arguments (model_path comes from YAML)
                 'sim_ns': LaunchConfiguration('sim_ns'),
                 'real_ns': LaunchConfiguration('real_ns'),
                 'input_sim': LaunchConfiguration('input_sim'),
@@ -84,7 +76,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         params_file,
-        model_path_arg,
         sim_ns, real_ns,
         input_sim, input_real,
         output_sim, output_real,
