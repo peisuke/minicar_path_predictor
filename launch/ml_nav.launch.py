@@ -28,7 +28,7 @@ def generate_launch_description():
     # Model path
     model_path_arg = DeclareLaunchArgument(
         'model_path',
-        default_value='/home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor.pt',
+        default_value='/home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor_multi_dist.pt',
         description='Path to trained model'
     )
 

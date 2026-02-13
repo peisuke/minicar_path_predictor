@@ -258,6 +258,9 @@ class MLNavNode(Node):
         self.smoothed_angle = 0.0
         self.ema_alpha = 0.4  # Configurable: 0=fully smooth, 1=no smoothing
 
+        # Track last linear velocity for speed-adaptive blending
+        self._last_linear_vel = 0.0
+
         # LiDAR data
         self.latest_lidar_data = None
         self.received_scan = False
@@ -319,13 +322,10 @@ class MLNavNode(Node):
         self.k_curvature = pd_params.get('k_curvature', 1.0)
         self.min_velocity = pd_params.get('min_velocity', 0.1)
 
-        # Multi-distance parameters
+        # Multi-distance geometric control parameters
         md_params = self._get_parameters_as_dict('multi_distance')
-        self.md_primary_lookahead = md_params.get('primary_lookahead', 0.5)
-        self.md_far_threshold = md_params.get('far_lookahead_threshold', 0.2)
-        self.md_agreement_threshold = md_params.get('agreement_threshold', 0.15)
-        self.md_speed_boost = md_params.get('speed_boost_far_straight', 1.2)
-        self.md_speed_penalty = md_params.get('speed_penalty_far_curve', 0.7)
+        self.blend_base = md_params.get('blend_base', 0.15)
+        self.blend_speed_k = md_params.get('blend_speed_k', 0.25)
 
     def _on_parameters_updated(self, params: list) -> SetParametersResult:
         """パラメータ更新を検知して制御パラメータを再読み込み"""
@@ -536,11 +536,15 @@ class MLNavNode(Node):
             # Predict target angle, path validity, and confidence
             raw_angle, has_path, confidence, angle_dict = self._predict_angle(lidar_data["ranges"])
 
+            # Multi-distance: geometric curvature + speed-adaptive blending
+            kappa = None
+            if len(angle_dict) >= 3:
+                kappa = self._compute_geometric_curvature(angle_dict)
+                raw_angle = self._blend_steering_angle(angle_dict)
+
             # EMA smoothing for temporal consistency
             if self.ema_adaptive:
-                # Adaptive: more responsive on curves, smoother on straights
                 angle_magnitude = abs(raw_angle)
-                # Interpolate: large angle → ema_alpha (responsive), small angle → ema_alpha_curve (smooth)
                 curve_blend = min(1.0, angle_magnitude / (math.pi / 4))
                 alpha = self.ema_alpha_curve + curve_blend * (self.ema_alpha - self.ema_alpha_curve)
             else:
@@ -549,16 +553,13 @@ class MLNavNode(Node):
                                    + (1 - alpha) * self.smoothed_angle)
             target_angle = self.smoothed_angle
 
-            # Multi-distance speed modulation
-            md_speed, md_conf = self._compute_multi_distance_factors(angle_dict)
-
             # Compute control using PD control (lock for thread safety)
             with self._ctrl_lock:
                 linear_vel, angular_vel = self._compute_pd_control(
-                    target_angle, confidence)
+                    target_angle, confidence, kappa)
 
-            # Apply multi-distance factors to linear velocity
-            linear_vel = max(self.min_velocity, linear_vel * md_speed * md_conf)
+            # Track velocity for speed-adaptive blending
+            self._last_linear_vel = linear_vel
 
             # Publish command
             cmd = Twist()
@@ -566,15 +567,15 @@ class MLNavNode(Node):
             cmd.angular.z = angular_vel
             self._publish_cmd_vel(cmd)
 
-            md_info = ""
-            if len(angle_dict) > 1:
-                md_info = f", md_spd={md_speed:.2f}, md_conf={md_conf:.2f}"
+            geo_info = ""
+            if kappa is not None:
+                geo_info = f", κ={kappa:.3f}"
             self.get_logger().info(
                 f"Control: raw={math.degrees(raw_angle):.1f}°, "
                 f"smoothed={math.degrees(target_angle):.1f}°, "
                 f"conf={confidence:.2f}, "
                 f"linear={linear_vel:.3f}, angular={angular_vel:.3f}"
-                f"{md_info}"
+                f"{geo_info}"
             )
 
         except Exception as e:
@@ -642,53 +643,100 @@ class MLNavNode(Node):
 
         return angle, has_path, confidence, angle_dict
 
-    def _compute_multi_distance_factors(self, angle_dict: dict) -> tuple:
-        """Compute speed and confidence factors from multi-distance predictions.
+    def _compute_geometric_curvature(self, angle_dict: dict) -> float:
+        """Estimate path curvature from multi-distance angle predictions.
 
-        Uses far-distance prediction for anticipatory speed control and
-        cross-distance agreement for confidence assessment.
+        Converts 3 angle predictions into waypoints and computes signed
+        curvature using the cross-product formula (same as Pure Pursuit):
+            κ = 2 * sin(θ) / chord
 
         Args:
-            angle_dict: {distance: angle_rad} for all lookahead distances
+            angle_dict: {distance: angle_rad} with at least 2 entries
 
         Returns:
-            (speed_factor, confidence_factor): multipliers for velocity control
+            Signed curvature κ (positive = left turn, negative = right turn).
+            Returns 0.0 if insufficient data.
         """
-        if len(angle_dict) <= 1:
-            return 1.0, 1.0  # Single distance: no multi-distance modulation
-
         distances = sorted(angle_dict.keys())
-        far_angle = angle_dict[distances[-1]]
+        if len(distances) < 2:
+            return 0.0
 
-        # Far-distance anticipation: straight ahead -> boost, curve -> brake
-        if abs(far_angle) < self.md_far_threshold:
-            speed_factor = self.md_speed_boost
-        else:
-            # Gradual penalty proportional to far angle magnitude
-            penalty_blend = min(1.0, abs(far_angle) / (math.pi / 4))
-            speed_factor = 1.0 - penalty_blend * (1.0 - self.md_speed_penalty)
+        # Use mid and far waypoints (skip near for stability)
+        d_mid = distances[-2]  # e.g. 0.5m
+        d_far = distances[-1]  # e.g. 1.0m
+        a_mid = angle_dict[d_mid]
+        a_far = angle_dict[d_far]
 
-        # Cross-distance agreement: low std -> high confidence -> speed up
-        angles = list(angle_dict.values())
-        angle_std = float(np.std(angles))
-        if angle_std < self.md_agreement_threshold:
-            confidence_factor = 1.1  # High agreement
-        else:
-            confidence_factor = max(0.8, 1.0 - (angle_std - self.md_agreement_threshold) * 2.0)
+        # Waypoints in robot frame: (d * sin(angle), d * cos(angle))
+        # Using forward=x convention: x = d*cos(a), y = d*sin(a)
+        p_mid_x = d_mid * math.cos(a_mid)
+        p_mid_y = d_mid * math.sin(a_mid)
+        p_far_x = d_far * math.cos(a_far)
+        p_far_y = d_far * math.sin(a_far)
 
-        return speed_factor, confidence_factor
+        # Vectors: origin→mid and mid→far
+        v1_x, v1_y = p_mid_x, p_mid_y
+        v2_x, v2_y = p_far_x - p_mid_x, p_far_y - p_mid_y
+
+        v1_len = math.sqrt(v1_x * v1_x + v1_y * v1_y)
+        v2_len = math.sqrt(v2_x * v2_x + v2_y * v2_y)
+
+        if v1_len < 1e-6 or v2_len < 1e-6:
+            return 0.0
+
+        # Signed sine of angle between vectors via cross product
+        cross = v1_x * v2_y - v1_y * v2_x
+        sin_theta = cross / (v1_len * v2_len)
+
+        # Chord from origin to far waypoint
+        chord = math.sqrt(p_far_x * p_far_x + p_far_y * p_far_y)
+        if chord < 1e-6:
+            return 0.0
+
+        kappa = 2.0 * sin_theta / chord
+        return kappa
+
+    def _blend_steering_angle(self, angle_dict: dict) -> float:
+        """Blend mid and far angle predictions based on current speed.
+
+        At higher speeds, weight shifts toward the far prediction for
+        anticipatory steering. At low speeds, mid prediction dominates.
+
+        Args:
+            angle_dict: {distance: angle_rad} with at least 2 entries
+
+        Returns:
+            Blended steering angle in radians.
+        """
+        distances = sorted(angle_dict.keys())
+        if len(distances) < 2:
+            return angle_dict[distances[0]]
+
+        a_mid = angle_dict[distances[-2]]  # e.g. 0.5m
+        a_far = angle_dict[distances[-1]]  # e.g. 1.0m
+
+        # Speed-adaptive far weight: increases with speed
+        speed_ratio = self._last_linear_vel / max(self.target_velocity, 0.01)
+        far_weight = self.blend_base + self.blend_speed_k * speed_ratio
+        far_weight = max(0.0, min(0.8, far_weight))  # clamp to [0, 0.8]
+
+        blended = (1.0 - far_weight) * a_mid + far_weight * a_far
+        return blended
 
     def _compute_pd_control(self, target_angle: float,
-                            confidence: float = 1.0) -> tuple:
+                            confidence: float = 1.0,
+                            kappa: float = None) -> tuple:
         """Compute PD control for velocity commands.
 
         Based on minicar_navigation's pd_pursuit_controller with enhancements:
-        - Angle change rate as pseudo-curvature for curve deceleration
+        - Geometric curvature (kappa) or angle-rate for curve deceleration
         - Confidence-based speed modulation
 
         Args:
             target_angle: Target angle in radians (robot frame)
             confidence: Model prediction confidence [0, 1]
+            kappa: Geometric curvature from multi-distance prediction.
+                   If None, falls back to temporal angle-rate.
 
         Returns:
             (linear_velocity, angular_velocity)
@@ -716,12 +764,16 @@ class MLNavNode(Node):
                           min(self.max_angular_velocity, angular_vel))
 
         # Linear velocity (reduce when turning)
-        # Pseudo-curvature from angle change rate
-        if dt > 0:
-            angle_rate = abs(angle_error - self.prev_angle_error) / dt
+        if kappa is not None:
+            # Geometric curvature: stable on steady curves (doesn't decay to 0)
+            curvature_factor = 1.0 / (1.0 + self.k_curvature * abs(kappa))
         else:
-            angle_rate = 0.0
-        curvature_factor = 1.0 / (1.0 + self.k_curvature * angle_rate)
+            # Fallback: temporal angle-rate (for single-distance models)
+            if dt > 0:
+                angle_rate = abs(angle_error - self.prev_angle_error) / dt
+            else:
+                angle_rate = 0.0
+            curvature_factor = 1.0 / (1.0 + self.k_curvature * angle_rate)
 
         heading_factor = max(0.5, 1.0 - abs(angle_error) / math.pi)
 
