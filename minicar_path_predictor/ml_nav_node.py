@@ -306,26 +306,26 @@ class MLNavNode(Node):
 
         # Common parameters
         self.lookahead_distance = common_params.get('lookahead_distance', 0.5)
-        self.target_velocity = common_params.get('target_velocity', 0.3)
-        self.max_angular_velocity = common_params.get('max_angular_velocity', 1.0)
+        self.target_velocity = common_params.get('target_velocity', 4.456)
+        self.max_angular_velocity = common_params.get('max_angular_velocity', 4.772)
         self.goal_tolerance = common_params.get('goal_tolerance', 0.1)
 
         # Prediction smoothing
-        self.ema_alpha = prediction_params.get('ema_alpha', 0.4)
-        self.softmax_temperature = prediction_params.get('softmax_temperature', 1.0)
+        self.ema_alpha = prediction_params.get('ema_alpha', 0.316)
+        self.softmax_temperature = prediction_params.get('softmax_temperature', 2.586)
         self.ema_adaptive = prediction_params.get('ema_adaptive', False)
-        self.ema_alpha_curve = prediction_params.get('ema_alpha_curve', 0.3)
+        self.ema_alpha_curve = prediction_params.get('ema_alpha_curve', 0.187)
 
         # PD controller parameters
-        self.kp_angular = pd_params.get('kp_angular', 2.0)
-        self.kd_angular = pd_params.get('kd_angular', 0.5)
-        self.k_curvature = pd_params.get('k_curvature', 1.0)
-        self.min_velocity = pd_params.get('min_velocity', 0.1)
+        self.kp_angular = pd_params.get('kp_angular', 6.319)
+        self.kd_angular = pd_params.get('kd_angular', 1.926)
+        self.k_curvature = pd_params.get('k_curvature', 1.246)
+        self.min_velocity = pd_params.get('min_velocity', 0.215)
 
         # Multi-distance geometric control parameters
         md_params = self._get_parameters_as_dict('multi_distance')
-        self.blend_base = md_params.get('blend_base', 0.15)
-        self.blend_speed_k = md_params.get('blend_speed_k', 0.25)
+        self.blend_base = md_params.get('blend_base', 0.096)
+        self.blend_speed_k = md_params.get('blend_speed_k', 0.008)
 
     def _on_parameters_updated(self, params: list) -> SetParametersResult:
         """パラメータ更新を検知して制御パラメータを再読み込み"""
