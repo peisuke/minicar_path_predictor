@@ -295,6 +295,9 @@ class MLNavNode(Node):
 
         # Prediction smoothing
         self.ema_alpha = prediction_params.get('ema_alpha', 0.4)
+        self.softmax_temperature = prediction_params.get('softmax_temperature', 1.0)
+        self.ema_adaptive = prediction_params.get('ema_adaptive', False)
+        self.ema_alpha_curve = prediction_params.get('ema_alpha_curve', 0.3)
 
         # PD controller parameters
         self.kp_angular = pd_params.get('kp_angular', 2.0)
@@ -491,8 +494,16 @@ class MLNavNode(Node):
             raw_angle, has_path, confidence = self._predict_angle(lidar_data["ranges"])
 
             # EMA smoothing for temporal consistency
-            self.smoothed_angle = (self.ema_alpha * raw_angle
-                                   + (1 - self.ema_alpha) * self.smoothed_angle)
+            if self.ema_adaptive:
+                # Adaptive: more responsive on curves, smoother on straights
+                angle_magnitude = abs(raw_angle)
+                # Interpolate: large angle → ema_alpha (responsive), small angle → ema_alpha_curve (smooth)
+                curve_blend = min(1.0, angle_magnitude / (math.pi / 4))
+                alpha = self.ema_alpha_curve + curve_blend * (self.ema_alpha - self.ema_alpha_curve)
+            else:
+                alpha = self.ema_alpha
+            self.smoothed_angle = (alpha * raw_angle
+                                   + (1 - alpha) * self.smoothed_angle)
             target_angle = self.smoothed_angle
 
             # Compute control using PD control (lock for thread safety)
@@ -550,7 +561,7 @@ class MLNavNode(Node):
                 has_path = True  # Single-task models always assume path exists
 
             # Softmax-weighted average for continuous angle output
-            probs = torch.softmax(angle_logits, dim=1).squeeze(0)  # (num_classes,)
+            probs = torch.softmax(angle_logits / self.softmax_temperature, dim=1).squeeze(0)  # (num_classes,)
             confidence = probs.max().item()
 
             if self.bin_centers is not None:

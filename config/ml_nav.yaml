@@ -15,7 +15,10 @@ ml_nav_node:
 
     # Prediction smoothing
     prediction:
-      ema_alpha: 0.534           # EMA smoothing factor [0=smooth, 1=no smoothing]
+      ema_alpha: 0.534             # EMA smoothing factor [0=smooth, 1=no smoothing]
+      softmax_temperature: 1.0     # Softmax temperature [<1=sharper, >1=softer]
+      ema_adaptive: false          # Adaptive EMA (responsive on curves, smooth on straights)
+      ema_alpha_curve: 0.3         # EMA alpha on straights when adaptive=true
 
     # PD controller parameters
     controllers:
