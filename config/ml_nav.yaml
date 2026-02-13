@@ -1,22 +1,22 @@
 # ML Navigation Node Configuration
-# Compatible with minicar_navigation parameter structure
+# Tuned by Optuna (50 trials, median of 15 successful)
 
 ml_nav_node:
   ros__parameters:
     # Model settings
-    model_path: "/home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor.pt"
+    model_path: /home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor.pt
 
     # Common parameters (same keys as local_nav_node)
     common:
       lookahead_distance: 0.5    # Look-ahead distance [m] - fixed by model
-      target_velocity: 0.3       # Target linear velocity [m/s]
-      max_angular_velocity: 1.0  # Maximum angular velocity [rad/s]
+      target_velocity: 3.0       # Target linear velocity [m/s]
+      max_angular_velocity: 8.0  # Maximum angular velocity [rad/s]
       goal_tolerance: 0.1        # Goal tolerance [m]
 
     # PD controller parameters
     controllers:
       pd:
-        kp_angular: 2.0            # Angular velocity proportional gain
+        kp_angular: 4.0            # Angular velocity proportional gain
         kd_angular: 0.5            # Angular velocity derivative gain
         k_curvature: 1.0           # Curvature sensitivity (not used in ML mode)
-        min_velocity: 0.1          # Minimum velocity [m/s]
+        min_velocity: 0.181        # Minimum velocity [m/s]

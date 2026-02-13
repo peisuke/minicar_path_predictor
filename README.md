@@ -149,12 +149,12 @@ minicar_path_predictor/
 | パラメータ | デフォルト | 説明 |
 |---|---|---|
 | `model_path` | `data/models/angle_predictor.pt` | モデルファイルパス |
-| `common.target_velocity` | 0.3 m/s | 目標速度 |
-| `common.max_angular_velocity` | 1.0 rad/s | 最大角速度 |
+| `common.target_velocity` | 3.0 m/s | 目標速度 |
+| `common.max_angular_velocity` | 8.0 rad/s | 最大角速度 |
 | `common.lookahead_distance` | 0.5 m | ルックアヘッド距離 |
-| `controllers.pd.kp_angular` | 2.0 | 角速度 P ゲイン |
+| `controllers.pd.kp_angular` | 4.0 | 角速度 P ゲイン |
 | `controllers.pd.kd_angular` | 0.5 | 角速度 D ゲイン |
-| `controllers.pd.min_velocity` | 0.1 m/s | 最低速度 |
+| `controllers.pd.min_velocity` | 0.181 m/s | 最低速度 |
 
 ## 安全機構
 
