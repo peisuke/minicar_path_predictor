@@ -1,5 +1,5 @@
 # ML Navigation Node Configuration
-# Tuned by Optuna (50 trials, median of 15 successful)
+# Tuned by Optuna v3 (20 trials, best=#17, distance=111.4m/60s)
 
 ml_nav_node:
   ros__parameters:
@@ -9,18 +9,18 @@ ml_nav_node:
     # Common parameters (same keys as local_nav_node)
     common:
       lookahead_distance: 0.5    # Look-ahead distance [m] - fixed by model
-      target_velocity: 3.0       # Target linear velocity [m/s]
-      max_angular_velocity: 8.0  # Maximum angular velocity [rad/s]
+      target_velocity: 1.625     # Target linear velocity [m/s]
+      max_angular_velocity: 7.37 # Maximum angular velocity [rad/s]
       goal_tolerance: 0.1        # Goal tolerance [m]
 
     # Prediction smoothing
     prediction:
-      ema_alpha: 0.4               # EMA smoothing factor [0=smooth, 1=no smoothing]
+      ema_alpha: 0.534           # EMA smoothing factor [0=smooth, 1=no smoothing]
 
     # PD controller parameters
     controllers:
       pd:
-        kp_angular: 4.0            # Angular velocity proportional gain
-        kd_angular: 0.5            # Angular velocity derivative gain
-        k_curvature: 1.0           # Curvature sensitivity for angle-rate deceleration
-        min_velocity: 0.181        # Minimum velocity [m/s]
+        kp_angular: 5.588        # Angular velocity proportional gain
+        kd_angular: 0.874        # Angular velocity derivative gain
+        k_curvature: 2.167       # Curvature sensitivity for angle-rate deceleration
+        min_velocity: 0.218      # Minimum velocity [m/s]
