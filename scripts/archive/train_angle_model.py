@@ -10,6 +10,21 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+from datetime import datetime
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+
+def get_run_name_with_timestamp(base_name: str) -> str:
+    """Generate run name with timestamp suffix."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if base_name:
+        return f"{base_name}_{timestamp}"
+    return f"run_{timestamp}"
 
 
 def angle_to_class(angle_rad, num_classes=9, angle_range=np.pi):
@@ -110,52 +125,61 @@ class AngleClassifierMLP(nn.Module):
 
 
 class AngleClassifierCNN(nn.Module):
-    """1D CNN for angle classification from LiDAR with circular padding."""
+    """1D CNN for angle classification from LiDAR with circular padding (5 layers)."""
 
     def __init__(self, input_dim=360, num_classes=9):
         super().__init__()
         self.num_classes = num_classes
         self.input_dim = input_dim
 
-        # CNN layers with circular padding
+        # CNN layers with circular padding (5 layers)
         self.conv1 = nn.Conv1d(1, 32, kernel_size=7, padding=0)
         self.bn1 = nn.BatchNorm1d(32)
         self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=0)
         self.bn2 = nn.BatchNorm1d(64)
         self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=0)
         self.bn3 = nn.BatchNorm1d(128)
+        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, padding=0)
+        self.bn4 = nn.BatchNorm1d(256)
+        self.conv5 = nn.Conv1d(256, 256, kernel_size=3, padding=0)
+        self.bn5 = nn.BatchNorm1d(256)
 
         self.pool = nn.MaxPool1d(2)
         self.dropout = nn.Dropout(0.3)
 
         # Calculate feature size after convolutions
-        # After conv1 (k=7, circular pad 3): 360 -> pool -> 180
-        # After conv2 (k=5, circular pad 2): 180 -> pool -> 90
-        # After conv3 (k=3, circular pad 1): 90 -> pool -> 45
-        self.fc1 = nn.Linear(128 * 45, 256)
-        self.bn_fc = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, num_classes)
+        # After conv1 (k=7): 360 -> pool -> 180
+        # After conv2 (k=5): 180 -> pool -> 90
+        # After conv3 (k=3): 90 -> pool -> 45
+        # After conv4 (k=3): 45 -> pool -> 22
+        # After conv5 (k=3): 22 -> pool -> 11
+        self.fc1 = nn.Linear(256 * 11, 512)
+        self.bn_fc = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, num_classes)
 
     def _circular_pad(self, x, pad):
         """Apply circular padding for 1D convolution."""
-        # x shape: (batch, channels, length)
         return torch.cat([x[:, :, -pad:], x, x[:, :, :pad]], dim=2)
 
     def forward(self, x):
         # x shape: (batch, 360)
         x = x.unsqueeze(1)  # (batch, 1, 360)
 
-        # Conv1 with circular padding
-        x = self._circular_pad(x, 3)  # pad 3 for kernel_size 7
+        # Conv1-5 with circular padding
+        x = self._circular_pad(x, 3)
         x = self.pool(torch.relu(self.bn1(self.conv1(x))))
 
-        # Conv2 with circular padding
-        x = self._circular_pad(x, 2)  # pad 2 for kernel_size 5
+        x = self._circular_pad(x, 2)
         x = self.pool(torch.relu(self.bn2(self.conv2(x))))
 
-        # Conv3 with circular padding
-        x = self._circular_pad(x, 1)  # pad 1 for kernel_size 3
+        x = self._circular_pad(x, 1)
         x = self.pool(torch.relu(self.bn3(self.conv3(x))))
+
+        x = self._circular_pad(x, 1)
+        x = self.pool(torch.relu(self.bn4(self.conv4(x))))
+
+        x = self._circular_pad(x, 1)
+        x = self.pool(torch.relu(self.bn5(self.conv5(x))))
 
         # Flatten and FC
         x = x.view(x.size(0), -1)
@@ -246,14 +270,42 @@ def main():
     parser.add_argument("--model", type=str, default="cnn", choices=["mlp", "cnn"], help="Model type")
     parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
     parser.add_argument("--class-weights", action="store_true", help="Use class weights for imbalanced data")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="minicar-angle-predictor", help="wandb project name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Save checkpoint every N epochs (0 to disable)")
     args = parser.parse_args()
+
+    # Generate run name with timestamp
+    run_name = get_run_name_with_timestamp(args.wandb_run_name or "1d-cnn")
+
+    # Initialize wandb
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if args.wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb not installed, logging disabled")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                "model": args.model,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "learning_rate": args.lr,
+                "num_classes": args.num_classes,
+                "augment": args.augment,
+                "class_weights": args.class_weights,
+            }
+        )
 
     num_classes = args.num_classes
     angle_range = np.pi  # ±90°
 
     data_dir = Path("data/training")
-    model_dir = Path("data/models")
+    model_dir = Path("data/models") / run_name
     model_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run name: {run_name}")
+    print(f"Model directory: {model_dir}")
 
     # Load data
     print("Loading data...")
@@ -348,27 +400,64 @@ def main():
         print(f"    Train Loss: {train_loss:.4f}, Acc: {train_acc:.1%}")
         print(f"    Val Loss: {val_loss:.4f}, Acc: {val_acc:.1%}, MAE: {mae_deg:.1f}°")
 
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "val/mae_degrees": mae_deg,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+            })
+
         # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_acc = val_acc
+            best_mae = mae_deg
             best_model_state = model.state_dict().copy()
             epochs_without_improvement = 0
             print(f"    -> New best model!")
+
+            # Save best checkpoint
+            best_checkpoint_path = model_dir / "best.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'mae_deg': mae_deg,
+            }, best_checkpoint_path)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                 break
 
+        # Save periodic checkpoint
+        if args.checkpoint_interval > 0 and (epoch + 1) % args.checkpoint_interval == 0:
+            checkpoint_path = model_dir / f"checkpoint_epoch{epoch + 1:03d}.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'mae_deg': mae_deg,
+            }, checkpoint_path)
+            print(f"    -> Saved checkpoint: {checkpoint_path.name}")
+
     # Restore best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\nRestored best model (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.1%})")
 
-    # Save model
-    model_path = model_dir / "angle_predictor.pt"
-    torch.save({
+    # Save final model
+    model_path = model_dir / "model_final.pt"
+    model_metadata = {
         'model_state_dict': model.state_dict(),
         'model_type': 'classifier',
         'model_arch': args.model,  # 'cnn' or 'mlp'
@@ -377,8 +466,31 @@ def main():
         'num_classes': num_classes,
         'angle_range': angle_range,
         'max_range': max_range,
-    }, model_path)
+        'best_val_loss': best_val_loss,
+        'best_val_acc': best_val_acc,
+        'best_mae': best_mae,
+        'run_name': run_name,
+    }
+    torch.save(model_metadata, model_path)
     print(f"\nModel saved to {model_path}")
+
+    # Upload to wandb Artifacts
+    if use_wandb:
+        artifact = wandb.Artifact(
+            name=f"model-{run_name}",
+            type="model",
+            description=f"1D CNN angle predictor ({args.model})",
+            metadata={
+                "val_accuracy": best_val_acc,
+                "val_loss": best_val_loss,
+                "mae_degrees": best_mae,
+                "num_classes": num_classes,
+            }
+        )
+        artifact.add_file(str(model_path))
+        artifact.add_file(str(model_dir / "best.pt"))
+        wandb.log_artifact(artifact)
+        print(f"Uploaded model to wandb Artifacts: model-{run_name}")
 
     # Test prediction
     print("\n=== Test Predictions ===")
@@ -397,6 +509,13 @@ def main():
             print(f"  Sample {i + 1}: pred={pred_class} ({np.degrees(pred_angle):+6.1f}°), "
                   f"target={target_class.item()} ({np.degrees(target_angle):+6.1f}°), "
                   f"{'OK' if pred_class == target_class.item() else 'MISS'}")
+
+    # Log final metrics and finish wandb
+    if use_wandb:
+        wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["best_val_accuracy"] = best_val_acc
+        wandb.summary["best_mae_degrees"] = best_mae
+        wandb.finish()
 
     print("\nDone!")
 

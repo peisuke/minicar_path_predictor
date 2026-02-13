@@ -9,14 +9,18 @@ Compatible with minicar_navigation's input/output configuration.
 
 import math
 import time
+import threading
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 
@@ -96,53 +100,139 @@ def class_to_angle(class_idx, num_classes=9, angle_range=math.pi):
     return angle
 
 
+def lidar_to_bev(lidar_ranges, image_size=64, max_range=12.0, view_range=3.0, robot_radius=2):
+    """Convert LiDAR ranges to Bird's Eye View image."""
+    img = np.zeros((image_size, image_size), dtype=np.float32)
+    center = image_size // 2
+    scale = center / view_range
+
+    angles = np.linspace(0, 2*np.pi, len(lidar_ranges), endpoint=False)
+    ranges_m = lidar_ranges * max_range
+    valid_mask = ranges_m < view_range
+
+    if valid_mask.sum() > 0:
+        valid_ranges = ranges_m[valid_mask]
+        valid_angles = angles[valid_mask]
+
+        x_robot = valid_ranges * np.cos(valid_angles)
+        y_robot = valid_ranges * np.sin(valid_angles)
+
+        px = (center - y_robot * scale).astype(np.int32)
+        py = (center - x_robot * scale).astype(np.int32)
+
+        valid_pixels = (px >= 0) & (px < image_size) & (py >= 0) & (py < image_size)
+        px = px[valid_pixels]
+        py = py[valid_pixels]
+
+        img[py, px] = 1.0
+
+    cv2.circle(img, (center, center), robot_radius, 0.5, -1)
+
+    return img
+
+
+class MultiTaskBEVCNN(nn.Module):
+    """2D CNN for multi-task BEV learning: path validity + angle classification (5 layers)."""
+
+    def __init__(self, num_classes=9, image_size=64):
+        super().__init__()
+        self.num_classes = num_classes
+        self.image_size = image_size
+
+        # Shared CNN backbone (5 conv layers)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.conv5 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
+
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(0.3)
+
+        # 64 -> 32 -> 16 -> 8 -> 4 -> 2
+        feat_size = image_size // 32
+        self.shared_fc = nn.Linear(256 * feat_size * feat_size, 512)
+        self.bn_fc = nn.BatchNorm1d(512)
+
+        # Path validity head (binary classification)
+        self.path_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),
+        )
+
+        # Angle classification head
+        self.angle_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        # x shape: (batch, 1, H, W)
+        x = self.pool(torch.relu(self.bn1(self.conv1(x))))  # 64->32
+        x = self.pool(torch.relu(self.bn2(self.conv2(x))))  # 32->16
+        x = self.pool(torch.relu(self.bn3(self.conv3(x))))  # 16->8
+        x = self.pool(torch.relu(self.bn4(self.conv4(x))))  # 8->4
+        x = self.pool(torch.relu(self.bn5(self.conv5(x))))  # 4->2
+
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+        shared = torch.relu(self.bn_fc(self.shared_fc(x)))
+        shared = self.dropout(shared)
+
+        path_logit = self.path_head(shared).squeeze(-1)
+        angle_logits = self.angle_head(shared)
+
+        return path_logit, angle_logits
+
+
 class MLNavNode(Node):
     """ML-based navigation node."""
 
-    # Emergency stop parameters
-    EMERGENCY_STOP_DIST = 0.20  # Stop if obstacle within 20cm
-    EMERGENCY_STOP_CONE_DEG = 45.0  # Check front ±45° cone
-    EMERGENCY_STOP_RATIO = 0.3  # Stop if 30% of cone is below threshold
-
-    def _declare_param_if_needed(self, name: str, default_value):
-        """Declare parameter only if not already declared."""
-        if not self.has_parameter(name):
-            self.declare_parameter(name, default_value)
+    # 緊急停止パラメータ (クラス定数 - local_nav_node と同一)
+    EMERGENCY_STOP_DIST = 0.20  # 20cm以内に障害物があれば停止
+    EMERGENCY_STOP_CONE_DEG = 45.0  # 前方±45°のコーンを検査
+    EMERGENCY_STOP_RATIO = 0.3  # コーン内の30%が閾値以下で停止（ノイズ除去）
 
     def __init__(self):
         super().__init__("ml_nav_node", automatically_declare_parameters_from_overrides=True)
 
-        # Declare parameters (only if not already declared from config file)
-        self._declare_param_if_needed("model_path", "data/models/angle_predictor.pt")
-        self._declare_param_if_needed("lookahead_distance", 0.5)
-        self._declare_param_if_needed("target_velocity", 0.3)
-        self._declare_param_if_needed("max_angular_velocity", 1.0)
-        self._declare_param_if_needed("kp_angular", 2.0)
-        self._declare_param_if_needed("kd_angular", 0.5)
-        self._declare_param_if_needed("control_rate", 10.0)
-
         # Input/Output namespace parameters (same as minicar_navigation)
-        self._declare_param_if_needed("input_sim", True)
-        self._declare_param_if_needed("input_real", False)
-        self._declare_param_if_needed("output_sim", True)
-        self._declare_param_if_needed("output_real", False)
-        self._declare_param_if_needed("sim_ns", "sim_robot")
-        self._declare_param_if_needed("real_ns", "real_robot")
-        self._declare_param_if_needed("robot_type", "diff")
+        if not self.has_parameter("input_sim"):
+            self.declare_parameter("input_sim", True)
+        if not self.has_parameter("input_real"):
+            self.declare_parameter("input_real", False)
+        if not self.has_parameter("output_sim"):
+            self.declare_parameter("output_sim", True)
+        if not self.has_parameter("output_real"):
+            self.declare_parameter("output_real", False)
+        if not self.has_parameter("sim_ns"):
+            self.declare_parameter("sim_ns", "sim_robot")
+        if not self.has_parameter("real_ns"):
+            self.declare_parameter("real_ns", "real_robot")
+        if not self.has_parameter("robot_type"):
+            self.declare_parameter("robot_type", "diff")
 
-        # Get parameters
-        model_path = self.get_parameter("model_path").get_parameter_value().string_value
-        self.lookahead_distance = self.get_parameter("lookahead_distance").get_parameter_value().double_value
-        self.target_velocity = self.get_parameter("target_velocity").get_parameter_value().double_value
-        self.max_angular_velocity = self.get_parameter("max_angular_velocity").get_parameter_value().double_value
-        self.kp_angular = self.get_parameter("kp_angular").get_parameter_value().double_value
-        self.kd_angular = self.get_parameter("kd_angular").get_parameter_value().double_value
-        control_rate = self.get_parameter("control_rate").get_parameter_value().double_value
+        # Model path (top-level param)
+        if not self.has_parameter("model_path"):
+            self.declare_parameter("model_path", "data/models/angle_predictor.pt")
 
         # Load model
+        model_path = self.get_parameter("model_path").get_parameter_value().string_value
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self._load_model(model_path)
         self.max_range = 12.0  # LiDAR max range for normalization
+
+        # Load control parameters from hierarchical structure
+        self._load_control_params()
 
         # PD control state
         self.prev_angle_error = 0.0
@@ -158,14 +248,80 @@ class MLNavNode(Node):
         # Setup output publishers (same as minicar_navigation)
         self.cmd_publishers = self._setup_output_publishers()
 
-        # Control loop timer
-        self.timer = self.create_timer(1.0 / control_rate, self.control_loop)
+        # Control loop timer - 10 Hz (same as local_nav_node)
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+        # Dynamic parameter update callback
+        self._ctrl_lock = threading.Lock()
+        self.add_on_set_parameters_callback(self._on_parameters_updated)
 
         self.get_logger().info(f"MLNavNode started")
         self.get_logger().info(f"  Model: {model_path}")
         self.get_logger().info(f"  Device: {self.device}")
-        self.get_logger().info(f"  Lookahead: {self.lookahead_distance}m")
-        self.get_logger().info(f"  Target velocity: {self.target_velocity}m/s")
+        self.get_logger().info(f"  Lookahead: {self.lookahead_distance}m (model fixed)")
+        self.get_logger().info(f"  Velocity: target={self.target_velocity}, min={self.min_velocity}")
+        self.get_logger().info(f"  PD control: kp={self.kp_angular}, kd={self.kd_angular}, k_curv={self.k_curvature}")
+        self.get_logger().info(f"  Max angular vel: {self.max_angular_velocity} rad/s")
+
+    def _get_parameters_as_dict(self, prefix: str) -> dict:
+        """指定されたプレフィックスのパラメータを辞書として取得"""
+        param_dict = {}
+        try:
+            params = self.get_parameters_by_prefix(prefix)
+            for key, param in params.items():
+                param_dict[key] = param.value
+        except Exception as e:
+            self.get_logger().warn(f"Failed to get parameters with prefix '{prefix}': {e}")
+        return param_dict
+
+    def _load_control_params(self):
+        """Load control parameters from hierarchical structure (common.* and controllers.pd.*)."""
+        common_params = self._get_parameters_as_dict('common')
+        pd_params = self._get_parameters_as_dict('controllers.pd')
+
+        # Common parameters
+        self.lookahead_distance = common_params.get('lookahead_distance', 0.5)
+        self.target_velocity = common_params.get('target_velocity', 0.3)
+        self.max_angular_velocity = common_params.get('max_angular_velocity', 1.0)
+        self.goal_tolerance = common_params.get('goal_tolerance', 0.1)
+
+        # PD controller parameters
+        self.kp_angular = pd_params.get('kp_angular', 2.0)
+        self.kd_angular = pd_params.get('kd_angular', 0.5)
+        self.k_curvature = pd_params.get('k_curvature', 1.0)
+        self.min_velocity = pd_params.get('min_velocity', 0.1)
+
+    def _on_parameters_updated(self, params: list) -> SetParametersResult:
+        """パラメータ更新を検知して制御パラメータを再読み込み"""
+        relevant = any(
+            p.name.startswith("common.") or p.name.startswith("controllers.")
+            for p in params
+        )
+
+        if not relevant:
+            return SetParametersResult(successful=True)
+
+        # パラメータが適用された「後」に再初期化したいので遅延実行
+        def apply():
+            with self._ctrl_lock:
+                self._load_control_params()
+                self.get_logger().info("Control params re-loaded due to parameter update.")
+                self.get_logger().info(
+                    f"  Velocity: target={self.target_velocity}, min={self.min_velocity}")
+                self.get_logger().info(
+                    f"  PD: kp={self.kp_angular}, kd={self.kd_angular}, k_curv={self.k_curvature}")
+                self.get_logger().info(
+                    f"  Max angular vel: {self.max_angular_velocity} rad/s")
+            # タイマーを破棄して一度だけ実行
+            if hasattr(self, '_param_update_timer') and self._param_update_timer:
+                self._param_update_timer.cancel()
+                self._param_update_timer = None
+
+        # 既存のタイマーがあればキャンセル
+        if hasattr(self, '_param_update_timer') and self._param_update_timer:
+            self._param_update_timer.cancel()
+        self._param_update_timer = self.create_timer(0.01, apply)
+        return SetParametersResult(successful=True)
 
     def _setup_input_subscribers(self):
         """Setup input subscribers based on namespace parameters (same as minicar_navigation)."""
@@ -238,8 +394,21 @@ class MLNavNode(Node):
             self.num_classes = checkpoint.get('num_classes', 9)
             self.angle_range = checkpoint.get('angle_range', math.pi)
 
+            # Detect multitask and BEV from model_type or explicit flags
+            self.is_multitask = checkpoint.get('is_multitask', 'multitask' in self.model_type)
+            self.is_bev = checkpoint.get('is_bev', 'bev' in self.model_type)
+
+            # BEV parameters (check both old and new keys for compatibility)
+            self.bev_image_size = checkpoint.get('bev_image_size', checkpoint.get('image_size', 64))
+            self.bev_view_range = checkpoint.get('bev_view_range', checkpoint.get('view_range', 3.0))
+
             # Create model based on architecture
-            if self.model_arch == 'cnn':
+            if self.is_bev and self.is_multitask:
+                model = MultiTaskBEVCNN(
+                    num_classes=self.num_classes,
+                    image_size=self.bev_image_size
+                )
+            elif self.model_arch == 'cnn':
                 model = AngleClassifierCNN(
                     input_dim=checkpoint.get('input_dim', 360),
                     num_classes=self.num_classes
@@ -255,7 +424,10 @@ class MLNavNode(Node):
             model = model.to(self.device)
             model.eval()
             self.max_range = checkpoint.get('max_range', 12.0)
-            self.get_logger().info(f"Model loaded: arch={self.model_arch}, classes={self.num_classes}")
+            self.get_logger().info(
+                f"Model loaded: arch={self.model_arch}, classes={self.num_classes}, "
+                f"multitask={self.is_multitask}, bev={self.is_bev}"
+            )
             return model
         except Exception as e:
             self.get_logger().error(f"Failed to load model: {e}")
@@ -298,11 +470,12 @@ class MLNavNode(Node):
             return
 
         try:
-            # Predict target angle
-            target_angle = self._predict_angle(lidar_data["ranges"])
+            # Predict target angle and path validity
+            target_angle, has_path = self._predict_angle(lidar_data["ranges"])
 
-            # Compute control using PD control
-            linear_vel, angular_vel = self._compute_pd_control(target_angle)
+            # Compute control using PD control (lock for thread safety)
+            with self._ctrl_lock:
+                linear_vel, angular_vel = self._compute_pd_control(target_angle)
 
             # Publish command
             cmd = Twist()
@@ -319,26 +492,46 @@ class MLNavNode(Node):
             self.get_logger().error(f"Control loop error: {e}")
             self._publish_stop()
 
-    def _predict_angle(self, ranges: np.ndarray) -> float:
-        """Predict target angle from LiDAR ranges."""
+    def _predict_angle(self, ranges: np.ndarray) -> tuple:
+        """Predict target angle from LiDAR ranges.
+
+        Returns:
+            (angle, has_path): angle in radians, has_path boolean
+        """
         # Normalize
         normalized = np.clip(ranges, 0, self.max_range) / self.max_range
 
-        # Convert to tensor
-        x = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
-
-        # Predict
         with torch.no_grad():
-            logits = self.model(x)
-            pred_class = torch.argmax(logits, dim=1).item()
+            if self.is_bev:
+                # Convert to BEV image
+                bev_img = lidar_to_bev(
+                    normalized,
+                    image_size=self.bev_image_size,
+                    max_range=self.max_range,
+                    view_range=self.bev_view_range
+                )
+                x = torch.tensor(bev_img, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+            else:
+                x = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+            if self.is_multitask:
+                path_logit, angle_logits = self.model(x)
+                has_path = torch.sigmoid(path_logit).item() > 0.5
+                pred_class = torch.argmax(angle_logits, dim=1).item()
+            else:
+                logits = self.model(x)
+                pred_class = torch.argmax(logits, dim=1).item()
+                has_path = True  # Single-task models always assume path exists
 
         # Convert class to angle
         angle = class_to_angle(pred_class, self.num_classes, self.angle_range)
 
-        return angle
+        return angle, has_path
 
     def _compute_pd_control(self, target_angle: float) -> tuple:
         """Compute PD control for velocity commands.
+
+        Same formula as minicar_navigation's pd_pursuit_controller.
 
         Args:
             target_angle: Target angle in radians (robot frame)
@@ -368,8 +561,12 @@ class MLNavNode(Node):
                           min(self.max_angular_velocity, angular_vel))
 
         # Linear velocity (reduce when turning)
+        # Same formula as minicar_navigation's pd_pursuit_controller
+        curvature = 0.0  # MLモデルでは曲率計算なし
+        curvature_factor = 1.0 / (1.0 + self.k_curvature * abs(curvature))
         heading_factor = max(0.5, 1.0 - abs(angle_error) / math.pi)
-        linear_vel = self.target_velocity * heading_factor
+        linear_vel = self.target_velocity * curvature_factor * heading_factor
+        linear_vel = max(self.min_velocity, linear_vel)
 
         # Update state
         self.prev_angle_error = angle_error
@@ -421,6 +618,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        stop = Twist()
+        node._publish_cmd_vel(stop)
         node.destroy_node()
         rclpy.shutdown()
 

@@ -10,7 +10,22 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+from datetime import datetime
 import cv2
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+
+def get_run_name_with_timestamp(base_name: str) -> str:
+    """Generate run name with timestamp suffix."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if base_name:
+        return f"{base_name}_{timestamp}"
+    return f"run_{timestamp}"
 
 
 def angle_to_class(angle_rad, num_classes=9, angle_range=np.pi):
@@ -129,35 +144,41 @@ class BEVDataset(Dataset):
 
 
 class BEVClassifierCNN(nn.Module):
-    """2D CNN for BEV image classification (shallow version)."""
+    """2D CNN for BEV image classification (5 layers)."""
 
     def __init__(self, num_classes=9, image_size=64):
         super().__init__()
         self.num_classes = num_classes
 
-        # Convolutional layers (3 layers instead of 4)
+        # Convolutional layers (5 layers)
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.conv5 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
 
         self.pool = nn.MaxPool2d(2, 2)
         self.dropout = nn.Dropout(0.3)
 
         # Calculate feature size after convolutions
-        # 64 -> 32 -> 16 -> 8
-        feat_size = image_size // 8
-        self.fc1 = nn.Linear(128 * feat_size * feat_size, 128)
-        self.bn_fc = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, num_classes)
+        # 64 -> 32 -> 16 -> 8 -> 4 -> 2
+        feat_size = image_size // 32
+        self.fc1 = nn.Linear(256 * feat_size * feat_size, 512)
+        self.bn_fc = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, num_classes)
 
     def forward(self, x):
         # Conv layers with pooling
         x = self.pool(torch.relu(self.bn1(self.conv1(x))))  # 64->32
         x = self.pool(torch.relu(self.bn2(self.conv2(x))))  # 32->16
         x = self.pool(torch.relu(self.bn3(self.conv3(x))))  # 16->8
+        x = self.pool(torch.relu(self.bn4(self.conv4(x))))  # 8->4
+        x = self.pool(torch.relu(self.bn5(self.conv5(x))))  # 4->2
 
         # Flatten and FC
         x = x.view(x.size(0), -1)
@@ -269,15 +290,45 @@ def main():
     parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
     parser.add_argument("--class-weights", action="store_true", help="Use class weights")
     parser.add_argument("--visualize", action="store_true", help="Visualize samples before training")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="minicar-angle-predictor", help="wandb project name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Save checkpoint every N epochs (0 to disable)")
     args = parser.parse_args()
+
+    # Generate run name with timestamp
+    run_name = get_run_name_with_timestamp(args.wandb_run_name or "bev-cnn")
+
+    # Initialize wandb
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if args.wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb not installed, logging disabled")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                "model": "bev_cnn",
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "learning_rate": args.lr,
+                "num_classes": args.num_classes,
+                "image_size": args.image_size,
+                "view_range": args.view_range,
+                "augment": args.augment,
+                "class_weights": args.class_weights,
+            }
+        )
 
     num_classes = args.num_classes
     image_size = args.image_size
     view_range = args.view_range
 
     data_dir = Path("data/training")
-    model_dir = Path("data/models")
+    model_dir = Path("data/models") / run_name
     model_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run name: {run_name}")
+    print(f"Model directory: {model_dir}")
 
     # Load data
     print("Loading data...")
@@ -371,26 +422,63 @@ def main():
         print(f"    Train Loss: {train_loss:.4f}, Acc: {train_acc:.1%}")
         print(f"    Val Loss: {val_loss:.4f}, Acc: {val_acc:.1%}, MAE: {mae_deg:.1f}°")
 
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "val/mae_degrees": mae_deg,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+            })
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_acc = val_acc
+            best_mae = mae_deg
             best_model_state = model.state_dict().copy()
             epochs_without_improvement = 0
             print(f"    -> New best model!")
+
+            # Save best checkpoint
+            best_checkpoint_path = model_dir / "best.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'mae_deg': mae_deg,
+            }, best_checkpoint_path)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                 break
 
+        # Save periodic checkpoint
+        if args.checkpoint_interval > 0 and (epoch + 1) % args.checkpoint_interval == 0:
+            checkpoint_path = model_dir / f"checkpoint_epoch{epoch + 1:03d}.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'mae_deg': mae_deg,
+            }, checkpoint_path)
+            print(f"    -> Saved checkpoint: {checkpoint_path.name}")
+
     # Restore best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\nRestored best model (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.1%})")
 
-    # Save model
-    model_path = model_dir / "angle_predictor_bev.pt"
-    torch.save({
+    # Save final model
+    model_path = model_dir / "model_final.pt"
+    model_metadata = {
         'model_state_dict': model.state_dict(),
         'model_type': 'classifier',
         'model_arch': 'bev_cnn',
@@ -399,8 +487,32 @@ def main():
         'num_classes': num_classes,
         'angle_range': np.pi,
         'max_range': max_range,
-    }, model_path)
+        'best_val_loss': best_val_loss,
+        'best_val_acc': best_val_acc,
+        'best_mae': best_mae,
+        'run_name': run_name,
+    }
+    torch.save(model_metadata, model_path)
     print(f"\nModel saved to {model_path}")
+
+    # Upload to wandb Artifacts
+    if use_wandb:
+        artifact = wandb.Artifact(
+            name=f"model-{run_name}",
+            type="model",
+            description="2D CNN BEV angle predictor",
+            metadata={
+                "val_accuracy": best_val_acc,
+                "val_loss": best_val_loss,
+                "mae_degrees": best_mae,
+                "num_classes": num_classes,
+                "image_size": image_size,
+            }
+        )
+        artifact.add_file(str(model_path))
+        artifact.add_file(str(model_dir / "best.pt"))
+        wandb.log_artifact(artifact)
+        print(f"Uploaded model to wandb Artifacts: model-{run_name}")
 
     # Test predictions
     print("\n=== Test Predictions ===")
@@ -418,6 +530,13 @@ def main():
             print(f"  Sample {i + 1}: pred={pred_class} ({np.degrees(pred_angle):+6.1f}°), "
                   f"target={target_class.item()} ({np.degrees(target_angle):+6.1f}°), "
                   f"{'OK' if pred_class == target_class.item() else 'MISS'}")
+
+    # Log final metrics and finish wandb
+    if use_wandb:
+        wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["best_val_accuracy"] = best_val_acc
+        wandb.summary["best_mae_degrees"] = best_mae
+        wandb.finish()
 
     print("\nDone!")
 

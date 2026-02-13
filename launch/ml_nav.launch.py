@@ -12,9 +12,11 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Package path for default config
-    pkg_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_config = os.path.join(pkg_path, 'config', 'ml_nav.yaml')
+    # Default config: ~/ml_controllers.yaml (tunable), fallback to package config
+    default_config = os.path.expanduser('~/ml_controllers.yaml')
+    if not os.path.exists(default_config):
+        pkg_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        default_config = os.path.join(pkg_path, 'config', 'ml_nav.yaml')
 
     # Control parameters (from config file)
     params_file = DeclareLaunchArgument(
@@ -67,6 +69,19 @@ def generate_launch_description():
         ],
     )
 
+    # Parameter server node for dynamic parameter management
+    # Reuses minicar_navigation's param_server_node
+    param_server_node = Node(
+        package='minicar_navigation',
+        executable='param_server_node.py',
+        name='param_server_node',
+        output='screen',
+        parameters=[{
+            'config_path': LaunchConfiguration('params_file'),
+            'target_node': '/ml_nav_node',
+        }],
+    )
+
     return LaunchDescription([
         params_file,
         model_path_arg,
@@ -76,4 +91,5 @@ def generate_launch_description():
         use_sim_time,
         robot_type,
         ml_nav_node,
+        param_server_node,
     ])
