@@ -29,25 +29,33 @@ def get_run_name_with_timestamp(base_name: str) -> str:
     return f"run_{timestamp}"
 
 
-def get_nonuniform_bins(angle_range_deg=90):
+def get_nonuniform_bins(angle_range_deg=90, num_classes=13):
     """Get non-uniform bin boundaries with finer resolution near center.
 
-    Boundaries: ±2.5°, ±7.5°, ±17.5°, ±32.5°, ±(angle_range/2)
-    Center class [-2.5°, +2.5°) has highest resolution (5°).
-    Resolution decreases toward edges: 5° -> 10° -> 15° -> edge
+    13-class (default): Center-concentrated with 2° resolution within ±5°.
+        Boundaries: [-45, -30, -20, -10, -5, -3, -1, +1, +3, +5, +10, +20, +30, +45]
+        Resolution: 2° (center) -> 5° -> 10° -> 15° (edge)
+
+    9-class (legacy): Finer resolution near center with 5° minimum.
+        Boundaries: [-45, -32.5, -17.5, -7.5, -2.5, +2.5, +7.5, +17.5, +32.5, +45]
+        Resolution: 5° (center) -> 10° -> 15° -> edge
 
     Returns boundaries and centers in radians.
     """
     half = angle_range_deg / 2  # e.g., 45° for ±45° range
-    # Boundaries in degrees: [-45, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, 45]
-    boundaries_deg = np.array([-half, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, half])
-    # Clip to actual range
+
+    if num_classes == 13:
+        # 13-class: center-concentrated
+        # Resolution from center: 2° -> 2° -> 2° -> 5° -> 10° -> 10° -> 15°
+        boundaries_deg = np.array([-half, -30, -20, -10, -5, -3, -1, 1, 3, 5, 10, 20, 30, half])
+    else:
+        # 9-class: legacy
+        boundaries_deg = np.array([-half, -32.5, -17.5, -7.5, -2.5, 2.5, 7.5, 17.5, 32.5, half])
+
     boundaries_deg = np.clip(boundaries_deg, -half, half)
-    # Remove duplicates and sort
     boundaries_deg = np.unique(boundaries_deg)
 
     boundaries_rad = np.radians(boundaries_deg)
-    # Centers are midpoints between boundaries
     centers_rad = (boundaries_rad[:-1] + boundaries_rad[1:]) / 2
     return boundaries_rad, centers_rad
 
@@ -126,18 +134,41 @@ def lidar_to_bev(lidar_ranges, image_size=64, max_range=12.0, view_range=3.0, ro
 
 
 class MultiTaskBEVDataset(Dataset):
-    """Dataset for multi-task BEV learning: path validity + angle classification."""
+    """Dataset for multi-task BEV learning: path validity + angle classification.
+
+    Supports multi-distance targets: when lookahead_indices is provided,
+    target_angles should be (N, num_all_distances) and target_classes will be
+    (N, len(lookahead_indices)).
+    """
 
     def __init__(self, lidar_data: np.ndarray, target_angles: np.ndarray, has_path: np.ndarray,
                  num_classes=9, image_size=64, view_range=3.0, max_range=12.0,
-                 angle_range=np.pi, augment=False, bin_boundaries=None):
+                 angle_range=np.pi, augment=False, bin_boundaries=None,
+                 lookahead_indices=None):
         self.lidar_data = lidar_data
         self.has_path = torch.tensor(has_path, dtype=torch.float32)
         self.angle_range = angle_range
         self.bin_boundaries = bin_boundaries
 
-        class_labels = np.array([angle_to_class(a, num_classes, angle_range, bin_boundaries) for a in target_angles])
-        self.target_classes = torch.tensor(class_labels, dtype=torch.long)
+        if lookahead_indices is not None and target_angles.ndim == 2:
+            # Multi-distance: stack classes for each distance column
+            class_arrays = []
+            for col_idx in lookahead_indices:
+                classes = np.array([
+                    angle_to_class(a, num_classes, angle_range, bin_boundaries)
+                    for a in target_angles[:, col_idx]
+                ])
+                class_arrays.append(classes)
+            # shape: (N, num_distances)
+            self.target_classes = torch.tensor(np.stack(class_arrays, axis=1), dtype=torch.long)
+            self.num_distances = len(lookahead_indices)
+        else:
+            # Single distance
+            class_labels = np.array([
+                angle_to_class(a, num_classes, angle_range, bin_boundaries) for a in target_angles
+            ])
+            self.target_classes = torch.tensor(class_labels, dtype=torch.long)
+            self.num_distances = 1
 
         self.num_classes = num_classes
         self.image_size = image_size
@@ -173,12 +204,16 @@ class MultiTaskBEVDataset(Dataset):
 
 
 class MultiTaskBEVCNN(nn.Module):
-    """2D CNN for multi-task BEV learning: path validity + angle classification (5 layers)."""
+    """2D CNN for multi-task BEV learning: path validity + angle classification (5 layers).
 
-    def __init__(self, num_classes=9, image_size=64):
+    Supports multi-distance prediction with separate angle heads per lookahead distance.
+    """
+
+    def __init__(self, num_classes=9, image_size=64, lookahead_distances=None):
         super().__init__()
         self.num_classes = num_classes
         self.image_size = image_size
+        self.lookahead_distances = lookahead_distances or [0.5]
 
         # Shared CNN backbone (5 conv layers)
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
@@ -208,13 +243,20 @@ class MultiTaskBEVCNN(nn.Module):
             nn.Linear(128, 1),
         )
 
-        # Angle classification head
-        self.angle_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
-        )
+        # Angle classification heads (one per lookahead distance)
+        self.angle_heads = nn.ModuleDict({
+            self._dist_key(d): nn.Sequential(
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, num_classes),
+            ) for d in self.lookahead_distances
+        })
+
+    @staticmethod
+    def _dist_key(d):
+        """Convert distance float to a valid module key."""
+        return f"d{d:.2f}".replace('.', '_')
 
     def forward(self, x):
         # x shape: (batch, 1, H, W)
@@ -230,13 +272,20 @@ class MultiTaskBEVCNN(nn.Module):
         shared = self.dropout(shared)
 
         path_logit = self.path_head(shared).squeeze(-1)
-        angle_logits = self.angle_head(shared)
+        angle_logits_dict = {
+            d: self.angle_heads[self._dist_key(d)](shared)
+            for d in self.lookahead_distances
+        }
 
-        return path_logit, angle_logits
+        return path_logit, angle_logits_dict
 
 
 def train_epoch(model, dataloader, criterion_path, criterion_angle, optimizer, device, angle_loss_weight=1.0):
-    """Train for one epoch with multi-task loss."""
+    """Train for one epoch with multi-task loss.
+
+    Supports both single-distance (angle_class shape: (B,)) and
+    multi-distance (angle_class shape: (B, num_distances)) targets.
+    """
     model.train()
     total_loss = 0.0
     path_correct = 0
@@ -250,13 +299,23 @@ def train_epoch(model, dataloader, criterion_path, criterion_angle, optimizer, d
         angle_class = angle_class.to(device)
 
         optimizer.zero_grad()
-        path_logit, angle_logits = model(bev_img)
+        path_logit, angle_logits_dict = model(bev_img)
 
         loss_path = criterion_path(path_logit, has_path)
 
         path_mask = has_path > 0.5
         if path_mask.sum() > 0:
-            loss_angle = criterion_angle(angle_logits[path_mask], angle_class[path_mask])
+            # Multi-distance: average CE loss across all heads
+            distances = sorted(angle_logits_dict.keys())
+            loss_angle = torch.tensor(0.0, device=device)
+            for i, dist in enumerate(distances):
+                logits = angle_logits_dict[dist]
+                if angle_class.ndim == 2:
+                    targets = angle_class[path_mask, i]
+                else:
+                    targets = angle_class[path_mask]
+                loss_angle = loss_angle + criterion_angle(logits[path_mask], targets)
+            loss_angle = loss_angle / len(distances)
         else:
             loss_angle = torch.tensor(0.0, device=device)
 
@@ -270,9 +329,16 @@ def train_epoch(model, dataloader, criterion_path, criterion_angle, optimizer, d
         path_correct += (path_pred == has_path).sum().item()
         total += has_path.size(0)
 
+        # Report accuracy for first (primary) head
         if path_mask.sum() > 0:
-            _, angle_pred = torch.max(angle_logits[path_mask], 1)
-            angle_correct += (angle_pred == angle_class[path_mask]).sum().item()
+            primary_dist = sorted(angle_logits_dict.keys())[0]
+            primary_logits = angle_logits_dict[primary_dist]
+            _, angle_pred = torch.max(primary_logits[path_mask], 1)
+            if angle_class.ndim == 2:
+                primary_targets = angle_class[path_mask, 0]
+            else:
+                primary_targets = angle_class[path_mask]
+            angle_correct += (angle_pred == primary_targets).sum().item()
             angle_total += path_mask.sum().item()
 
     path_acc = path_correct / total if total > 0 else 0
@@ -282,7 +348,11 @@ def train_epoch(model, dataloader, criterion_path, criterion_angle, optimizer, d
 
 def evaluate(model, dataloader, criterion_path, criterion_angle, device,
              num_classes=9, angle_range=np.pi, bin_centers=None):
-    """Evaluate model."""
+    """Evaluate model.
+
+    Supports both single-distance and multi-distance models.
+    Reports per-head accuracy/MAE for multi-distance.
+    """
     model.eval()
     total_loss = 0.0
     path_correct = 0
@@ -291,6 +361,9 @@ def evaluate(model, dataloader, criterion_path, criterion_angle, device,
     total = 0
     all_angle_preds = []
     all_angle_targets = []
+    # Per-head tracking for multi-distance
+    per_head_preds = {}
+    per_head_targets = {}
 
     with torch.no_grad():
         for bev_img, has_path, angle_class in dataloader:
@@ -298,13 +371,31 @@ def evaluate(model, dataloader, criterion_path, criterion_angle, device,
             has_path = has_path.to(device)
             angle_class = angle_class.to(device)
 
-            path_logit, angle_logits = model(bev_img)
+            path_logit, angle_logits_dict = model(bev_img)
 
             loss_path = criterion_path(path_logit, has_path)
 
             path_mask = has_path > 0.5
             if path_mask.sum() > 0:
-                loss_angle = criterion_angle(angle_logits[path_mask], angle_class[path_mask])
+                distances = sorted(angle_logits_dict.keys())
+                loss_angle = torch.tensor(0.0, device=device)
+                for i, dist in enumerate(distances):
+                    logits = angle_logits_dict[dist]
+                    if angle_class.ndim == 2:
+                        targets = angle_class[path_mask, i]
+                    else:
+                        targets = angle_class[path_mask]
+                    loss_angle = loss_angle + criterion_angle(logits[path_mask], targets)
+
+                    # Per-head tracking
+                    _, preds = torch.max(logits[path_mask], 1)
+                    if dist not in per_head_preds:
+                        per_head_preds[dist] = []
+                        per_head_targets[dist] = []
+                    per_head_preds[dist].extend(preds.cpu().numpy())
+                    per_head_targets[dist].extend(targets.cpu().numpy())
+
+                loss_angle = loss_angle / len(distances)
             else:
                 loss_angle = torch.tensor(0.0, device=device)
 
@@ -314,24 +405,38 @@ def evaluate(model, dataloader, criterion_path, criterion_angle, device,
             path_correct += (path_pred == has_path).sum().item()
             total += has_path.size(0)
 
+            # Primary head accuracy (first distance)
             if path_mask.sum() > 0:
-                _, angle_pred = torch.max(angle_logits[path_mask], 1)
-                angle_correct += (angle_pred == angle_class[path_mask]).sum().item()
+                primary_dist = sorted(angle_logits_dict.keys())[0]
+                primary_logits = angle_logits_dict[primary_dist]
+                _, angle_pred = torch.max(primary_logits[path_mask], 1)
+                if angle_class.ndim == 2:
+                    primary_targets = angle_class[path_mask, 0]
+                else:
+                    primary_targets = angle_class[path_mask]
+                angle_correct += (angle_pred == primary_targets).sum().item()
                 angle_total += path_mask.sum().item()
                 all_angle_preds.extend(angle_pred.cpu().numpy())
-                all_angle_targets.extend(angle_class[path_mask].cpu().numpy())
+                all_angle_targets.extend(primary_targets.cpu().numpy())
 
     path_acc = path_correct / total if total > 0 else 0
     angle_acc = angle_correct / angle_total if angle_total > 0 else 0
 
     if len(all_angle_preds) > 0:
         pred_angles = np.array([class_to_angle(p, num_classes, angle_range, bin_centers) for p in all_angle_preds])
-        target_angles = np.array([class_to_angle(t, num_classes, angle_range, bin_centers) for t in all_angle_targets])
-        mae_degrees = np.degrees(np.mean(np.abs(pred_angles - target_angles)))
+        target_angles_arr = np.array([class_to_angle(t, num_classes, angle_range, bin_centers) for t in all_angle_targets])
+        mae_degrees = np.degrees(np.mean(np.abs(pred_angles - target_angles_arr)))
     else:
         mae_degrees = 0.0
 
-    return total_loss / len(dataloader), path_acc, angle_acc, mae_degrees
+    # Per-head MAE for multi-distance
+    per_head_mae = {}
+    for dist in per_head_preds:
+        preds = np.array([class_to_angle(p, num_classes, angle_range, bin_centers) for p in per_head_preds[dist]])
+        tgts = np.array([class_to_angle(t, num_classes, angle_range, bin_centers) for t in per_head_targets[dist]])
+        per_head_mae[dist] = np.degrees(np.mean(np.abs(preds - tgts)))
+
+    return total_loss / len(dataloader), path_acc, angle_acc, mae_degrees, per_head_mae
 
 
 def main():
@@ -351,6 +456,8 @@ def main():
                         help="Use non-uniform bins with finer resolution near center (0,±5,±10,±25,±40°)")
     parser.add_argument("--lookahead-idx", type=int, default=None,
                         help="Index of lookahead distance to use (if data has multiple). None=auto-detect or use column 0")
+    parser.add_argument("--multi-distance", type=str, default=None,
+                        help="Comma-separated column indices for multi-distance heads (e.g., '0,1,3' for 0.25m,0.5m,1.0m)")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb-project", type=str, default="minicar-angle-predictor", help="wandb project name")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name")
@@ -392,7 +499,7 @@ def main():
     bin_boundaries = None
     bin_centers = None
     if args.nonuniform_bins:
-        bin_boundaries, bin_centers = get_nonuniform_bins(args.angle_range)
+        bin_boundaries, bin_centers = get_nonuniform_bins(args.angle_range, args.num_classes)
         num_classes = len(bin_centers)  # Override num_classes based on boundaries
         print(f"  Using non-uniform bins: {len(bin_centers)} classes")
         print(f"  Boundaries (deg): {np.degrees(bin_boundaries).astype(int)}")
@@ -415,6 +522,8 @@ def main():
 
     # Handle multi-column target_angles (multiple lookahead distances)
     lookahead_dist = None
+    multi_distance_indices = None  # column indices for multi-distance
+    multi_distance_dists = None    # actual distances (meters)
     if target_angles.ndim == 2:
         # Load lookahead distances if available
         lookahead_dists_file = data_dir / "lookahead_distances.npy"
@@ -424,19 +533,34 @@ def main():
         else:
             lookahead_dists = None
 
-        # Select which column to use
-        lookahead_idx = args.lookahead_idx if args.lookahead_idx is not None else 0
-        if lookahead_idx >= target_angles.shape[1]:
-            print(f"  Warning: --lookahead-idx {lookahead_idx} >= {target_angles.shape[1]}, using 0")
-            lookahead_idx = 0
-
-        if lookahead_dists is not None:
-            lookahead_dist = lookahead_dists[lookahead_idx]
-            print(f"  Using lookahead distance: {lookahead_dist}m (index {lookahead_idx})")
+        if args.multi_distance is not None:
+            # Multi-distance mode: use multiple columns
+            multi_distance_indices = [int(x) for x in args.multi_distance.split(',')]
+            for idx in multi_distance_indices:
+                if idx >= target_angles.shape[1]:
+                    raise ValueError(f"--multi-distance index {idx} >= {target_angles.shape[1]}")
+            if lookahead_dists is not None:
+                multi_distance_dists = [float(lookahead_dists[i]) for i in multi_distance_indices]
+                print(f"  Multi-distance mode: indices={multi_distance_indices}, "
+                      f"distances={multi_distance_dists}m")
+            else:
+                multi_distance_dists = [0.25 * (i + 1) for i in multi_distance_indices]
+                print(f"  Multi-distance mode: indices={multi_distance_indices}")
+            # Keep target_angles as 2D for Dataset
         else:
-            print(f"  Using lookahead index: {lookahead_idx}")
+            # Single distance mode
+            lookahead_idx = args.lookahead_idx if args.lookahead_idx is not None else 0
+            if lookahead_idx >= target_angles.shape[1]:
+                print(f"  Warning: --lookahead-idx {lookahead_idx} >= {target_angles.shape[1]}, using 0")
+                lookahead_idx = 0
 
-        target_angles = target_angles[:, lookahead_idx]
+            if lookahead_dists is not None:
+                lookahead_dist = lookahead_dists[lookahead_idx]
+                print(f"  Using lookahead distance: {lookahead_dist}m (index {lookahead_idx})")
+            else:
+                print(f"  Using lookahead index: {lookahead_idx}")
+
+            target_angles = target_angles[:, lookahead_idx]
 
     print(f"  has_path: {has_path.sum()} with path, {(~has_path).sum()} without path")
     print(f"  Classification: {num_classes} classes, angle_range: ±{args.angle_range/2:.0f}°")
@@ -457,12 +581,12 @@ def main():
     train_dataset = MultiTaskBEVDataset(
         lidar_data[train_indices], target_angles[train_indices], has_path[train_indices],
         num_classes, image_size, view_range, max_range, angle_range, augment=args.augment,
-        bin_boundaries=bin_boundaries
+        bin_boundaries=bin_boundaries, lookahead_indices=multi_distance_indices
     )
     val_dataset = MultiTaskBEVDataset(
         lidar_data[val_indices], target_angles[val_indices], has_path[val_indices],
         num_classes, image_size, view_range, max_range, angle_range, augment=False,
-        bin_boundaries=bin_boundaries
+        bin_boundaries=bin_boundaries, lookahead_indices=multi_distance_indices
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
@@ -475,7 +599,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}")
 
-    model = MultiTaskBEVCNN(num_classes=num_classes, image_size=image_size).to(device)
+    model = MultiTaskBEVCNN(
+        num_classes=num_classes, image_size=image_size,
+        lookahead_distances=multi_distance_dists
+    ).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Model parameters: {num_params:,}")
 
@@ -497,7 +624,7 @@ def main():
         train_loss, train_path_acc, train_angle_acc = train_epoch(
             model, train_loader, criterion_path, criterion_angle, optimizer, device, args.angle_loss_weight
         )
-        val_loss, val_path_acc, val_angle_acc, mae_deg = evaluate(
+        val_loss, val_path_acc, val_angle_acc, mae_deg, per_head_mae = evaluate(
             model, val_loader, criterion_path, criterion_angle, device, num_classes, angle_range, bin_centers
         )
 
@@ -506,9 +633,12 @@ def main():
         print(f"  Epoch {epoch + 1}/{args.epochs}")
         print(f"    Train Loss: {train_loss:.4f}, Path Acc: {train_path_acc:.1%}, Angle Acc: {train_angle_acc:.1%}")
         print(f"    Val Loss: {val_loss:.4f}, Path Acc: {val_path_acc:.1%}, Angle Acc: {val_angle_acc:.1%}, MAE: {mae_deg:.1f}°")
+        if len(per_head_mae) > 1:
+            head_str = ", ".join(f"{d:.2f}m={m:.1f}°" for d, m in sorted(per_head_mae.items()))
+            print(f"    Per-head MAE: {head_str}")
 
         if use_wandb:
-            wandb.log({
+            log_dict = {
                 "epoch": epoch + 1,
                 "train/loss": train_loss,
                 "train/path_accuracy": train_path_acc,
@@ -518,7 +648,10 @@ def main():
                 "val/angle_accuracy": val_angle_acc,
                 "val/mae_degrees": mae_deg,
                 "learning_rate": optimizer.param_groups[0]['lr'],
-            })
+            }
+            for dist, mae in per_head_mae.items():
+                log_dict[f"val/mae_d{dist:.2f}"] = mae
+            wandb.log(log_dict)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -590,6 +723,9 @@ def main():
         'nonuniform_bins': args.nonuniform_bins,
         # Lookahead distance used for training
         'lookahead_distance': float(lookahead_dist) if lookahead_dist is not None else None,
+        # Multi-distance metadata
+        'multi_distance': multi_distance_dists is not None,
+        'lookahead_distances': multi_distance_dists or ([float(lookahead_dist)] if lookahead_dist is not None else [0.5]),
     }
     torch.save(model_metadata, model_path)
     print(f"\nModel saved to {model_path}")
