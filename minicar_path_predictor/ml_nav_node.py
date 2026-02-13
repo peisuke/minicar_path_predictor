@@ -134,12 +134,16 @@ def lidar_to_bev(lidar_ranges, image_size=64, max_range=12.0, view_range=3.0, ro
 
 
 class MultiTaskBEVCNN(nn.Module):
-    """2D CNN for multi-task BEV learning: path validity + angle classification (5 layers)."""
+    """2D CNN for multi-task BEV learning: path validity + angle classification (5 layers).
 
-    def __init__(self, num_classes=9, image_size=64):
+    Supports multi-distance prediction with separate angle heads per lookahead distance.
+    """
+
+    def __init__(self, num_classes=9, image_size=64, lookahead_distances=None):
         super().__init__()
         self.num_classes = num_classes
         self.image_size = image_size
+        self.lookahead_distances = lookahead_distances or [0.5]
 
         # Shared CNN backbone (5 conv layers)
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
@@ -169,13 +173,20 @@ class MultiTaskBEVCNN(nn.Module):
             nn.Linear(128, 1),
         )
 
-        # Angle classification head
-        self.angle_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
-        )
+        # Angle classification heads (one per lookahead distance)
+        self.angle_heads = nn.ModuleDict({
+            self._dist_key(d): nn.Sequential(
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, num_classes),
+            ) for d in self.lookahead_distances
+        })
+
+    @staticmethod
+    def _dist_key(d):
+        """Convert distance float to a valid module key."""
+        return f"d{d:.2f}".replace('.', '_')
 
     def forward(self, x):
         # x shape: (batch, 1, H, W)
@@ -191,9 +202,12 @@ class MultiTaskBEVCNN(nn.Module):
         shared = self.dropout(shared)
 
         path_logit = self.path_head(shared).squeeze(-1)
-        angle_logits = self.angle_head(shared)
+        angle_logits_dict = {
+            d: self.angle_heads[self._dist_key(d)](shared)
+            for d in self.lookahead_distances
+        }
 
-        return path_logit, angle_logits
+        return path_logit, angle_logits_dict
 
 
 class MLNavNode(Node):
@@ -305,11 +319,19 @@ class MLNavNode(Node):
         self.k_curvature = pd_params.get('k_curvature', 1.0)
         self.min_velocity = pd_params.get('min_velocity', 0.1)
 
+        # Multi-distance parameters
+        md_params = self._get_parameters_as_dict('multi_distance')
+        self.md_primary_lookahead = md_params.get('primary_lookahead', 0.5)
+        self.md_far_threshold = md_params.get('far_lookahead_threshold', 0.2)
+        self.md_agreement_threshold = md_params.get('agreement_threshold', 0.15)
+        self.md_speed_boost = md_params.get('speed_boost_far_straight', 1.2)
+        self.md_speed_penalty = md_params.get('speed_penalty_far_curve', 0.7)
+
     def _on_parameters_updated(self, params: list) -> SetParametersResult:
         """パラメータ更新を検知して制御パラメータを再読み込み"""
         relevant = any(
             p.name.startswith("common.") or p.name.startswith("prediction.")
-            or p.name.startswith("controllers.")
+            or p.name.startswith("controllers.") or p.name.startswith("multi_distance.")
             for p in params
         )
 
@@ -421,11 +443,16 @@ class MLNavNode(Node):
             self.bev_image_size = checkpoint.get('bev_image_size', checkpoint.get('image_size', 64))
             self.bev_view_range = checkpoint.get('bev_view_range', checkpoint.get('view_range', 3.0))
 
+            # Multi-distance head support
+            self.is_multi_distance = checkpoint.get('multi_distance', False)
+            self.lookahead_distances = checkpoint.get('lookahead_distances', [0.5])
+
             # Create model based on architecture
             if self.is_bev and self.is_multitask:
                 model = MultiTaskBEVCNN(
                     num_classes=self.num_classes,
-                    image_size=self.bev_image_size
+                    image_size=self.bev_image_size,
+                    lookahead_distances=self.lookahead_distances,
                 )
             elif self.model_arch == 'cnn':
                 model = AngleClassifierCNN(
@@ -439,14 +466,30 @@ class MLNavNode(Node):
                     num_classes=self.num_classes
                 )
 
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # Remap old single-head state dict to new multi-head format
+            state_dict = checkpoint['model_state_dict']
+            if self.is_bev and self.is_multitask and not self.is_multi_distance:
+                # Old checkpoint: angle_head.* -> angle_heads.d0_50.*
+                remapped = {}
+                dist_key = MultiTaskBEVCNN._dist_key(self.lookahead_distances[0])
+                for k, v in state_dict.items():
+                    if k.startswith('angle_head.'):
+                        new_key = k.replace('angle_head.', f'angle_heads.{dist_key}.', 1)
+                        remapped[new_key] = v
+                    else:
+                        remapped[k] = v
+                state_dict = remapped
+
+            model.load_state_dict(state_dict)
             model = model.to(self.device)
             model.eval()
             self.max_range = checkpoint.get('max_range', 12.0)
             bins_info = "nonuniform" if self.bin_centers else "uniform"
+            dist_info = f", distances={self.lookahead_distances}" if self.is_multi_distance else ""
             self.get_logger().info(
                 f"Model loaded: arch={self.model_arch}, classes={self.num_classes}, "
                 f"multitask={self.is_multitask}, bev={self.is_bev}, bins={bins_info}"
+                f"{dist_info}"
             )
             return model
         except Exception as e:
@@ -491,7 +534,7 @@ class MLNavNode(Node):
 
         try:
             # Predict target angle, path validity, and confidence
-            raw_angle, has_path, confidence = self._predict_angle(lidar_data["ranges"])
+            raw_angle, has_path, confidence, angle_dict = self._predict_angle(lidar_data["ranges"])
 
             # EMA smoothing for temporal consistency
             if self.ema_adaptive:
@@ -506,10 +549,16 @@ class MLNavNode(Node):
                                    + (1 - alpha) * self.smoothed_angle)
             target_angle = self.smoothed_angle
 
+            # Multi-distance speed modulation
+            md_speed, md_conf = self._compute_multi_distance_factors(angle_dict)
+
             # Compute control using PD control (lock for thread safety)
             with self._ctrl_lock:
                 linear_vel, angular_vel = self._compute_pd_control(
                     target_angle, confidence)
+
+            # Apply multi-distance factors to linear velocity
+            linear_vel = max(self.min_velocity, linear_vel * md_speed * md_conf)
 
             # Publish command
             cmd = Twist()
@@ -517,11 +566,15 @@ class MLNavNode(Node):
             cmd.angular.z = angular_vel
             self._publish_cmd_vel(cmd)
 
+            md_info = ""
+            if len(angle_dict) > 1:
+                md_info = f", md_spd={md_speed:.2f}, md_conf={md_conf:.2f}"
             self.get_logger().info(
                 f"Control: raw={math.degrees(raw_angle):.1f}°, "
                 f"smoothed={math.degrees(target_angle):.1f}°, "
                 f"conf={confidence:.2f}, "
                 f"linear={linear_vel:.3f}, angular={angular_vel:.3f}"
+                f"{md_info}"
             )
 
         except Exception as e:
@@ -535,7 +588,11 @@ class MLNavNode(Node):
         instead of discrete argmax.
 
         Returns:
-            (angle, has_path, confidence): angle in radians, has_path boolean, confidence [0,1]
+            (angle, has_path, confidence, angle_dict):
+                angle: primary angle in radians
+                has_path: boolean
+                confidence: [0,1]
+                angle_dict: {distance: angle} for all lookahead distances (multi-distance)
         """
         # Normalize
         normalized = np.clip(ranges, 0, self.max_range) / self.max_range
@@ -554,28 +611,72 @@ class MLNavNode(Node):
                 x = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
 
             if self.is_multitask:
-                path_logit, angle_logits = self.model(x)
+                path_logit, angle_logits_dict = self.model(x)
                 has_path = torch.sigmoid(path_logit).item() > 0.5
             else:
-                angle_logits = self.model(x)
+                angle_logits_dict = {0.5: self.model(x)}
                 has_path = True  # Single-task models always assume path exists
 
-            # Softmax-weighted average for continuous angle output
-            probs = torch.softmax(angle_logits / self.softmax_temperature, dim=1).squeeze(0)  # (num_classes,)
-            confidence = probs.max().item()
-
+            # Precompute bin centers tensor
             if self.bin_centers is not None:
                 centers = torch.tensor(self.bin_centers, dtype=torch.float32, device=self.device)
             else:
-                # Uniform bins
                 centers = torch.tensor(
                     [class_to_angle(i, self.num_classes, self.angle_range)
                      for i in range(self.num_classes)],
                     dtype=torch.float32, device=self.device
                 )
-            angle = (probs * centers).sum().item()
 
-        return angle, has_path, confidence
+            # Compute softmax-weighted angle for each distance
+            angle_dict = {}
+            primary_confidence = 0.0
+            primary_dist = self.lookahead_distances[0] if len(self.lookahead_distances) == 1 else 0.5
+            for dist, logits in angle_logits_dict.items():
+                probs = torch.softmax(logits / self.softmax_temperature, dim=1).squeeze(0)
+                angle_dict[dist] = (probs * centers).sum().item()
+                if dist == primary_dist:
+                    primary_confidence = probs.max().item()
+
+            angle = angle_dict.get(primary_dist, angle_dict[self.lookahead_distances[0]])
+            confidence = primary_confidence
+
+        return angle, has_path, confidence, angle_dict
+
+    def _compute_multi_distance_factors(self, angle_dict: dict) -> tuple:
+        """Compute speed and confidence factors from multi-distance predictions.
+
+        Uses far-distance prediction for anticipatory speed control and
+        cross-distance agreement for confidence assessment.
+
+        Args:
+            angle_dict: {distance: angle_rad} for all lookahead distances
+
+        Returns:
+            (speed_factor, confidence_factor): multipliers for velocity control
+        """
+        if len(angle_dict) <= 1:
+            return 1.0, 1.0  # Single distance: no multi-distance modulation
+
+        distances = sorted(angle_dict.keys())
+        far_angle = angle_dict[distances[-1]]
+
+        # Far-distance anticipation: straight ahead -> boost, curve -> brake
+        if abs(far_angle) < self.md_far_threshold:
+            speed_factor = self.md_speed_boost
+        else:
+            # Gradual penalty proportional to far angle magnitude
+            penalty_blend = min(1.0, abs(far_angle) / (math.pi / 4))
+            speed_factor = 1.0 - penalty_blend * (1.0 - self.md_speed_penalty)
+
+        # Cross-distance agreement: low std -> high confidence -> speed up
+        angles = list(angle_dict.values())
+        angle_std = float(np.std(angles))
+        if angle_std < self.md_agreement_threshold:
+            confidence_factor = 1.1  # High agreement
+        else:
+            confidence_factor = max(0.8, 1.0 - (angle_std - self.md_agreement_threshold) * 2.0)
+
+        return speed_factor, confidence_factor
 
     def _compute_pd_control(self, target_angle: float,
                             confidence: float = 1.0) -> tuple:

@@ -1,29 +1,37 @@
 # ML Navigation Node Configuration
-# Tuned by Optuna v3 (20 trials, best=#17, distance=111.4m/60s)
+# Multi-distance model + Optuna v5 (20 trials, best=#17, distance=110.8m/60s)
 
 ml_nav_node:
   ros__parameters:
     # Model settings
-    model_path: /home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor.pt
+    model_path: /home/ubuntu/ros2_ws/src/minicar_path_predictor/data/models/angle_predictor_multi_dist.pt
 
     # Common parameters (same keys as local_nav_node)
     common:
       lookahead_distance: 0.5    # Look-ahead distance [m] - fixed by model
-      target_velocity: 1.625     # Target linear velocity [m/s]
-      max_angular_velocity: 7.37 # Maximum angular velocity [rad/s]
+      target_velocity: 2.896     # Target linear velocity [m/s]
+      max_angular_velocity: 8.37 # Maximum angular velocity [rad/s]
       goal_tolerance: 0.1        # Goal tolerance [m]
 
     # Prediction smoothing
     prediction:
-      ema_alpha: 0.534             # EMA smoothing factor [0=smooth, 1=no smoothing]
-      softmax_temperature: 1.0     # Softmax temperature [<1=sharper, >1=softer]
+      ema_alpha: 0.890             # EMA smoothing factor [0=smooth, 1=no smoothing]
+      softmax_temperature: 1.364   # Softmax temperature [<1=sharper, >1=softer]
       ema_adaptive: false          # Adaptive EMA (responsive on curves, smooth on straights)
       ema_alpha_curve: 0.3         # EMA alpha on straights when adaptive=true
 
     # PD controller parameters
     controllers:
       pd:
-        kp_angular: 5.588        # Angular velocity proportional gain
-        kd_angular: 0.874        # Angular velocity derivative gain
-        k_curvature: 2.167       # Curvature sensitivity for angle-rate deceleration
-        min_velocity: 0.218      # Minimum velocity [m/s]
+        kp_angular: 9.020        # Angular velocity proportional gain
+        kd_angular: 1.403        # Angular velocity derivative gain
+        k_curvature: 1.670       # Curvature sensitivity for angle-rate deceleration
+        min_velocity: 0.300      # Minimum velocity [m/s]
+
+    # Multi-distance prediction parameters (active when model has multiple heads)
+    multi_distance:
+      primary_lookahead: 0.5       # Primary distance for steering [m]
+      far_lookahead_threshold: 0.305 # Far-distance "straight" threshold [rad]
+      agreement_threshold: 0.199    # Cross-distance agreement threshold [rad]
+      speed_boost_far_straight: 1.324  # Speed multiplier when far predicts straight
+      speed_penalty_far_curve: 0.765   # Speed multiplier when far predicts curve
